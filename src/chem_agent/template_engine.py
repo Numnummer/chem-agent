@@ -47,6 +47,34 @@ RDLogger.DisableLog("rdApp.*")
 
 MAP_NUM_RE = re.compile(r":\d+\]")
 
+# Прецедент без ссылки на первоисточник (решение 0007, 0008).
+NO_SOURCE = "без источника"
+
+# Растворители: если их атомы не вошли в продукт, это агенты, а не
+# сопутствующие реагенты (решение 0008). Вода и спирты, вошедшие в продукт
+# (гидролиз, переэтерификация), по разметке остаются реагирующими.
+SOLVENTS = {
+    "O",  # вода
+    "CO",  # метанол
+    "CCO",  # этанол
+    "CC(C)O",  # изопропанол
+    "C1CCOC1",  # THF
+    "C1COCCO1",  # диоксан
+    "COCCOC",  # DME
+    "CCOCC",  # диэтиловый эфир
+    "ClCCl",  # DCM
+    "ClC(Cl)Cl",  # хлороформ
+    "CN(C)C=O",  # DMF
+    "CS(C)=O",  # DMSO
+    "CN1CCCC1=O",  # NMP
+    "CC#N",  # ацетонитрил
+    "CC(C)=O",  # ацетон
+    "CCOC(C)=O",  # этилацетат
+    "Cc1ccccc1",  # толуол
+    "c1ccccc1",  # бензол
+    "CCCCCC",  # гексан
+}
+
 
 # ---------------------------------------------------------------------------
 # Общие утилиты
@@ -165,6 +193,7 @@ def cmd_map(args):
             "agents": agents,
             "mapped_rxn": "",
             "map_confidence": "",
+            "source": row.get(args.source_col, ""),
         }
         if MAP_NUM_RE.search(reac + ">>" + prod):
             rec["mapped_rxn"] = reac + ">>" + prod  # уже размечено в корпусе
@@ -208,7 +237,11 @@ def cmd_map(args):
                 f"[map] {done}/{len(todo)} ({done / (time.time() - t0):.1f} р/с)", file=sys.stderr
             )
 
-    write_csv(args.out, out_rows, ["id", "rxn_original", "agents", "mapped_rxn", "map_confidence"])
+    write_csv(
+        args.out,
+        out_rows,
+        ["id", "rxn_original", "agents", "mapped_rxn", "map_confidence", "source"],
+    )
     print(f"[map] записано {len(out_rows)} -> {args.out}", file=sys.stderr)
 
 
@@ -222,11 +255,13 @@ def prepare_for_extraction(mapped_rxn: str):
     Оставляем один основной продукт (самый тяжёлый фрагмент) — генератор
     нужен для главного продукта, побочные (вода, соли) достраивает балансировщик.
     Возвращает (реагирующие_mapped, основной_продукт_mapped,
-                реагирующие_без_разметки, продукт_без_разметки, сопутствующие).
+                реагирующие_без_разметки, продукт_без_разметки, сопутствующие,
+                растворители).
     Сопутствующие — реагенты, ни один атом которых не попал в основной продукт
     (основания, кислоты, окислители). Они не входят в шаблон, но по ним
     превращение привязывается к веществу: NaOH «ведёт» нейтрализацию, хотя
-    его атомов в продукте нет.
+    его атомов в продукте нет. Неучаствующие растворители (SOLVENTS) —
+    не сопутствующие реагенты, а агенты: их возвращаем отдельно.
     """
     reac, _, prod = mapped_rxn.split(">")
     prod_frags = [p for p in prod.split(".") if p]
@@ -238,13 +273,14 @@ def prepare_for_extraction(mapped_rxn: str):
     reacting = [r for r in reac_frags if mapnums(r) & main_maps]
     if not reacting:
         return None
-    spectators = [canon(r) for r in reac_frags if not (mapnums(r) & main_maps)]
+    others = [c for r in reac_frags if not (mapnums(r) & main_maps) and (c := canon(r))]
     return (
         ".".join(reacting),
         main,
         [canon(r) for r in reacting],
         canon(main),
-        [s for s in spectators if s],
+        [s for s in others if s not in SOLVENTS],
+        [s for s in others if s in SOLVENTS],
     )
 
 
@@ -267,7 +303,7 @@ def cmd_extract(args):
         if prepared is None:
             stats["skip_unparsable"] += 1
             continue
-        reac_m, prod_m, reac_plain, prod_plain, spectators = prepared
+        reac_m, prod_m, reac_plain, prod_plain, spectators, solvents = prepared
         if None in reac_plain or prod_plain is None:
             stats["skip_unparsable"] += 1
             continue
@@ -329,7 +365,8 @@ def cmd_extract(args):
                     "reactants": reac_plain,
                     "product": prod_plain,
                     "spectators": spectators,
-                    "agents": row.get("agents", ""),
+                    "agents": ".".join(a for a in [row.get("agents", "")] + solvents if a),
+                    "source": row.get("source", ""),
                     "selfcheck": ok,
                 }
             )
@@ -413,6 +450,11 @@ class Template:
         except Exception:
             self.retro_rxn = None
         self.spectator_sets = [frag_set(".".join(ex.get("spectators", []))) for ex in self.examples]
+        # Прецедент для выдачи: первый пример со ссылкой на источник, иначе первый.
+        self.precedent = next(
+            (ex for ex in self.examples if ex.get("source") not in ("", None, NO_SOURCE)),
+            self.examples[0],
+        )
         # Одномолекулярный шаблон, у которого во всех прецедентах был
         # сопутствующий реагент (нейтрализация, омыление, гидролиз): без этого
         # реагента превращение не идёт, и применять его «в пустоту» нельзя.
@@ -580,7 +622,7 @@ def cmd_apply(args):
                 source = (
                     ",".join(sorted({src for _, src in combo if src not in ("input",)})) or "none"
                 )
-            ex = t.examples[0]
+            ex = t.precedent
             rec = {
                 "level": level,
                 "input_name": name,
@@ -598,6 +640,7 @@ def cmd_apply(args):
                 "needs_counterion": Chem.GetFormalCharge(Chem.MolFromSmiles(prod)) != 0,
                 "precedent_id": ex["id"],
                 "precedent_rxn": ".".join(ex["reactants"]) + ">>" + ex["product"],
+                "precedent_source": ex.get("source") or NO_SOURCE,
             }
             results.append(rec)
             stats[name]["reactions"] += 1
@@ -700,6 +743,7 @@ def cmd_apply(args):
         "needs_counterion",
         "precedent_id",
         "precedent_rxn",
+        "precedent_source",
     ]
     write_csv(args.out, results, fields)
     elapsed = time.time() - t_start
@@ -859,6 +903,9 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--corpus", required=True)
     m.add_argument("--smiles-col", default="rxn_smiles")
     m.add_argument("--id-col", default="id")
+    m.add_argument(
+        "--source-col", default="source", help="колонка источника (патент); переносится как есть"
+    )
     m.add_argument("--out", required=True)
     m.add_argument("--batch", type=int, default=32)
     m.set_defaults(func=cmd_map)

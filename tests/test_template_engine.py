@@ -11,7 +11,14 @@ import json
 
 from conftest import INPUTS, PURCHASABLE, write_inputs
 
-from chem_agent.template_engine import canon, frag_set, type_key
+from chem_agent.template_engine import (
+    NO_SOURCE,
+    canon,
+    frag_set,
+    main,
+    prepare_for_extraction,
+    type_key,
+)
 
 with open(INPUTS, encoding="utf-8") as f:
     USER_SET = [r["smiles"] for r in csv.DictReader(f) if r["smiles"] != "resource"]
@@ -43,6 +50,30 @@ def test_counter_ions_ignored_in_fragment_sets():
 def test_all_templates_reproduce_their_precedents(templates_path):
     for t in load_templates(templates_path):
         assert t["selfcheck_rate"] == 1.0, t["id"]
+
+
+def test_solvents_are_not_spectator_reagents():
+    """Растворитель, не вошедший в продукт, — агент, а не сопутствующий реагент.
+    Иначе «THF + вода» станет обязательным реагентом шаблона и статьёй затрат."""
+    mapped = "[CH3:1][C:2](=[O:3])[OH:4].[Na+].[OH-].C1CCOC1.O>>[CH3:1][C:2](=[O:3])[O-:4]"
+    *_, spectators, solvents = prepare_for_extraction(mapped)
+    assert sorted(spectators) == ["[Na+]", "[OH-]"]
+    assert sorted(solvents) == ["C1CCOC1", "O"]
+
+
+def test_map_keeps_source_column(tmp_path):
+    """Уже размеченная реакция проходит map без модели; источник не теряется."""
+    corpus = tmp_path / "c.csv"
+    with open(corpus, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["id", "rxn_smiles", "source"])
+        w.writerow(
+            ["X1", "[CH3:1][OH:2].[CH2:3]1[CH2:4][O:5]1>>[CH3:1][O:2][CH2:3][CH2:4][OH:5]", "US1"]
+        )
+    out = tmp_path / "m.csv"
+    main(["map", "--corpus", str(corpus), "--out", str(out)])
+    rows = list(csv.DictReader(open(out, encoding="utf-8")))
+    assert rows[0]["source"] == "US1"
 
 
 def test_manual_templates_are_trusted(templates_path):
@@ -137,3 +168,14 @@ def test_sles_route_found_from_priority_set(run_apply):
 def test_every_candidate_has_precedent(run_apply):
     rows = run_apply("--purchasable", str(PURCHASABLE))
     assert all(r["precedent_id"] for r in rows)
+
+
+def test_candidate_shows_precedent_source(run_apply):
+    """Источник прецедента виден в выдаче; прецедент без источника помечен явно."""
+    rows = run_apply("--internal-only")
+    by_rxn = {r["reaction_smiles"]: r for r in rows}
+    burn = by_rxn["S1SSSSSSS1.O=O>>O=S=O"]  # ручная библиотека, MAN-S01
+    assert burn["precedent_source"].startswith("Сжигание серы")
+    assert all(r["precedent_source"] for r in rows)
+    # демо-корпус синтетический, источников у него нет
+    assert any(r["precedent_source"] == NO_SOURCE for r in rows)
