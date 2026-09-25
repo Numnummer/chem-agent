@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(make test)",
+      "Bash(make test-all)",
+      "Bash(make lint)",
+      "Bash(make format)",
+      "Bash(make demo)",
+      "Bash(make fixtures)",
+      "Bash(python -m pytest *)",
+      "Bash(python -m chem_agent.template_engine *)",
+      "Bash(ruff *)",
+      "Bash(git status)",
+      "Bash(git diff *)",
+      "Bash(git log *)"
+    ],
+    "deny": [
+      "Edit(./data/raw/**)",
+      "Edit(./tests/fixtures/**)",
+      "Read(./.env)",
+      "Read(./.env.*)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/ruff-after-edit.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

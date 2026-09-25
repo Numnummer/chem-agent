@@ -1,0 +1,21 @@
+# данные и результаты
+data/raw/*
+!data/raw/.gitkeep
+outputs/*
+!outputs/.gitkeep
+
+# python
+__pycache__/
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# личные настройки Claude Code
+.claude/settings.local.json
+
+.env
+.env.*
+
+# редактор
+.vscode/

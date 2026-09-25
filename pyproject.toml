@@ -1,0 +1,39 @@
+[project]
+name = "chem-agent"
+version = "0.1.0"
+description = "Химический агент НИОКР: шаблонная генерация реакций, валидация, покрытие"
+requires-python = ">=3.10"
+dependencies = [
+    "rdkit>=2024.3",
+    "rdchiral>=1.1",
+]
+
+[project.optional-dependencies]
+# rxnmapper нужен только для шага map; ему требуется setuptools<81 (pkg_resources)
+mapping = ["rxnmapper>=0.4", "setuptools<81"]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+chem-templates = "chem_agent.template_engine:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "slow: требует rxnmapper и загрузки модели маппинга",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501"]

@@ -1,0 +1,8 @@
+id,rxn_smiles,source,note
+MAN-S01,S1SSSSSSS1.O=O>>O=S=O,Сжигание серы (сернокислотное производство),S8 + 8 O2 -> 8 SO2
+MAN-S02,O=S=O.O=O>>O=S(=O)=O,Контактный процесс (V2O5),2 SO2 + O2 -> 2 SO3; катализатор V2O5
+MAN-S03,O=S(=O)=O.O>>O=S(=O)(O)O,Абсорбция SO3,SO3 + H2O -> H2SO4 (в олеуме)
+MAN-S04,S.O=O>>O=S=O,Процесс Клауса (термическая стадия),2 H2S + 3 O2 -> 2 SO2 + 2 H2O
+MAN-S05,O=S(=O)(O)O.[Na+].[OH-]>>O=S(=O)([O-])O.[Na+],Нейтрализация серной кислоты,H2SO4 + NaOH -> NaHSO4 + H2O
+MAN-S06,O=S=O.[Na+].[OH-]>>O=S([O-])O.[Na+],Щелочная абсорбция SO2,SO2 + NaOH -> NaHSO3
+MAN-C01,O=C=O.[Na+].[OH-]>>O=C([O-])O.[Na+],Щелочная абсорбция CO2,CO2 + NaOH -> NaHCO3
