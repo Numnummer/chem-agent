@@ -6,11 +6,15 @@
 «устаревший тест»: разберитесь в причине, прежде чем править ожидания.
 """
 
+import csv
 import json
 
-from conftest import PURCHASABLE, write_inputs
+from conftest import INPUTS, PURCHASABLE, write_inputs
 
 from chem_agent.template_engine import canon, frag_set, type_key
+
+with open(INPUTS, encoding="utf-8") as f:
+    USER_SET = [r["smiles"] for r in csv.DictReader(f) if r["smiles"] != "resource"]
 
 
 def products(rows):
@@ -106,6 +110,22 @@ def test_internal_only_uses_only_the_set(run_apply):
     rows = run_apply("--internal-only")
     assert rows
     assert {r["partner_source"] for r in rows} <= {"internal", "internal+intermediate"}
+
+
+def test_internal_label_means_all_participants_from_the_set(run_apply):
+    """На стадиях ≥2 входное вещество — промежуточный продукт. Реакция с ним
+    не может считаться «все участники из исходного набора» (критерий 2.1)."""
+    rows = run_apply("--depth", "3", "--internal-only")
+    user = frozenset().union(*(frag_set(s) for s in USER_SET))
+    internal = [r for r in rows if r["partner_source"] == "internal"]
+    assert internal
+    for r in internal:
+        reac, reag, _ = r["reaction_smiles"].split(">")
+        assert frag_set(reac + ("." + reag if reag else "")) <= user, r["reaction_smiles"]
+    # додеканол + SO3: SO3 получен из серы за две стадии, это не «внутри набора»
+    sulfation = [r for r in rows if r["product"] == canon("CCCCCCCCCCCCOS(=O)(=O)O")]
+    assert sulfation
+    assert all(r["partner_source"] == "internal+intermediate" for r in sulfation)
 
 
 def test_sles_route_found_from_priority_set(run_apply):

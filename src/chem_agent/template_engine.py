@@ -569,11 +569,9 @@ def cmd_apply(args):
                     {"input_name": name, "template_id": t.id, "reaction_smiles": rxn_smiles}
                 )
                 continue
-            participants = [s for s, src in combo if src != "input"]
-            if role == "reagent":
-                participants = smiles_combo
-            elif reagent:
-                participants = participants + [reagent]
+            # Само входное вещество тоже участник: на стадиях ≥2 это
+            # промежуточный продукт, а не вещество исходного набора.
+            participants = smiles_combo + ([reagent] if reagent else [])
             if all(frag_set(s) in user_frags for s in participants):
                 source = "internal"  # все участники — исходный набор
             elif all(frag_set(s) in pool_frags for s in participants):
