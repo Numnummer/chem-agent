@@ -19,4 +19,6 @@
 
 ## Проверка
 `test_roundtrip_rejects_epoxide_deoxygenation`,
-`test_roundtrip_off_lets_false_positive_through` (контроль, что проверка нужна).
+`test_roundtrip_off_lets_false_positive_through` (контроль, что проверка нужна;
+с 28.09.2026 — на реальном шаблоне T00277, т. к. демо-пример теперь отсекает
+и правило активации, решение 0012).

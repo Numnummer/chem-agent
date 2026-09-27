@@ -463,3 +463,38 @@ def test_new_stereocenter_kept_on_chiral_substrate():
         reduction, [Chem.MolFromSmiles("C[C@H](O)CC(C)=O")], keep_new_stereo=False
     )
     assert any(p.count("@") == 2 for p in prods)
+
+
+# --- Активация OH как уходящей группы -----------------------------------------
+
+DIOL_TO_EPOXIDE = "O-[CH2;D2;+0:1]-[C:2]-[OH;D1;+0:3]>>[C:2]1-[CH2;D2;+0:1]-[O;H0;D2;+0:3]-1"
+
+
+@pytest.mark.parametrize(
+    "spectators",
+    [["CS(=O)(=O)Cl"], ["O=S(Cl)Cl"], ["ClP(Cl)(Cl)=O"], ["c1ccc(P(c2ccccc2)c2ccccc2)cc1"]],
+)
+def test_activators_classified(spectators):
+    from chem_agent.template_engine import reagent_functions
+
+    assert "activator" in reagent_functions(spectators)
+
+
+def test_hydroxyl_leaving_sp3_needs_activation():
+    """Строки 14, 20 ревью full-v3: диол + NaOH -> эпоксид (T01070). OH не
+    уходит с sp3-углерода без активации (MsCl в прецеденте); NaOH её не даёт."""
+    from rdkit import Chem
+
+    assert "activation" in intrinsic_functions(DIOL_TO_EPOXIDE)
+    t = _template(DIOL_TO_EPOXIDE, [["CS(=O)(=O)Cl", "[Na+]", "[OH-]"], ["[Na+]", "[OH-]"]])
+    assert not t.can_be_reagent(NAOH, Chem.MolFromSmiles(NAOH))
+    # в прецедентах и активатор (MsCl), и основание: одно вещество их не закрывает
+    from chem_agent.template_engine import covers
+
+    assert not covers(t.required_functions, {"activator"})
+    assert covers(t.required_functions, {"activator", "base"})
+
+
+def test_epoxide_opening_and_esterification_need_no_activation():
+    assert "activation" not in intrinsic_functions(ALKOXYLATION)
+    assert "activation" not in intrinsic_functions(ESTERIFICATION)

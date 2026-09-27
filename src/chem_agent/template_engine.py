@@ -731,7 +731,11 @@ COUNTER_IONS = {"[Na+]", "[K+]", "[Li+]", "[Cl-]", "[Br-]", "[I-]", "[H+]"}
 # нужны шаблону по его прецедентам: NaOH не окисляет и не восстанавливает.
 BASE, OXIDANT, REDUCTANT, ACID = "base", "oxidant", "reductant", "acid"
 METAL_CATALYST = "metal_catalyst"
-FUNCTIONS = (BASE, OXIDANT, REDUCTANT, ACID, METAL_CATALYST)
+ACTIVATOR = "activator"  # MsCl, TsCl, SOCl2, PCl3/POCl3, PPh3, DEAD, DCC
+FUNCTIONS = (BASE, OXIDANT, REDUCTANT, ACID, METAL_CATALYST, ACTIVATOR)
+# Требование превращения «активировать OH как уходящую группу»: закрывается
+# кислотой или активатором.
+ACTIVATION = "activation"
 # Условия процесса, а не сырьё: не блокируют реакцию, указываются в выдаче.
 CONDITIONS = {METAL_CATALYST}
 REQUIRED_SHARE = 0.5  # функция нужна шаблону, если есть в >50% прецедентов
@@ -757,6 +761,16 @@ _ACID_SMILES = {
 }
 
 
+def covers(required: set[str], functions: set[str]) -> bool:
+    """Закрывает ли набор функций требования шаблона (катализатор — условие)."""
+    needed = required - CONDITIONS
+    if ACTIVATION in needed:
+        if not functions & {ACID, ACTIVATOR}:
+            return False
+        needed = needed - {ACTIVATION}
+    return needed <= functions
+
+
 def _fragment_functions(smiles: str, has_hydride_carrier: bool) -> set[str]:
     if smiles in _BASE_SMILES:
         return {BASE}
@@ -774,8 +788,18 @@ def _fragment_functions(smiles: str, has_hydride_carrier: bool) -> set[str]:
     out = set()
     for a in mol.GetAtoms():
         sym, q = a.GetSymbol(), a.GetFormalCharge()
+        halo_nbr = any(n.GetSymbol() in ("Cl", "Br", "I") for n in a.GetNeighbors())
+        dbl = [b for b in a.GetBonds() if b.GetBondType() == Chem.BondType.DOUBLE]
         if sym in _CATALYST_METALS:
             out.add(METAL_CATALYST)  # Pd, Pt, Ni, V2O5...
+        elif sym == "S" and halo_nbr and dbl:
+            out.add(ACTIVATOR)  # MsCl, TsCl, SOCl2
+        elif sym == "P" and (halo_nbr or (a.GetDegree() == 3 and not dbl)):
+            out.add(ACTIVATOR)  # PCl3, POCl3, PBr3, PPh3
+        elif sym == "N" and any(b.GetOtherAtom(a).GetSymbol() == "N" for b in dbl):
+            out.add(ACTIVATOR)  # азодикарбоксилаты (DEAD, DIAD)
+        elif sym == "C" and sum(b.GetOtherAtom(a).GetSymbol() == "N" for b in dbl) == 2:
+            out.add(ACTIVATOR)  # карбодиимиды (DCC, EDC)
         elif sym in ("B", "Al") and (a.GetTotalNumHs() > 0 or q < 0):
             out.add(REDUCTANT)  # борогидриды, алюмогидриды
         elif (
@@ -892,6 +916,7 @@ def intrinsic_functions(forward: str) -> set[str]:
         наоборот — основание.
     """
     rxn = AllChem.ReactionFromSmarts(forward)
+    slots_all = [rxn.GetReactantTemplate(i) for i in range(rxn.GetNumReactantTemplates())]
 
     def mapped(n, get):
         return {
@@ -917,6 +942,21 @@ def intrinsic_functions(forward: str) -> set[str]:
             loses_h |= hp < hr
     # Протон, перешедший внутри реакции (OH бисульфита -> O раскрытого
     # эпоксида), внешней кислоты или основания не требует.
+    # OH/OR не уходит с sp3-углерода без активации (кислота или MsCl, PPh3...)
+    for m in slots_all:
+        for a in m.GetAtoms():
+            if a.GetAtomicNum() != 8 or a.GetAtomMapNum():
+                continue
+            for b in a.GetBonds():
+                c = b.GetOtherAtom(a)
+                if (
+                    c.GetAtomicNum() == 6
+                    and c.GetAtomMapNum()
+                    and not c.GetIsAromatic()
+                    and b.GetBondType() == Chem.BondType.SINGLE
+                    and not any(x.GetBondType() != Chem.BondType.SINGLE for x in c.GetBonds())
+                ):
+                    need.add(ACTIVATION)
     if protonated and not loses_h:
         need.add(ACID)
     if deprotonated and not gains_h:
@@ -1039,7 +1079,7 @@ class Template:
         fs = frag_set(smiles)
         if not fs or not any(fs <= sp for sp in self.spectator_sets):
             return False
-        if not (self.required_functions - CONDITIONS) <= functions:
+        if not covers(self.required_functions, functions):
             return False
         # окислитель/восстановитель — только в окислительно-восстановительном
         # превращении, либо если прецеденты устойчиво (>=50%) его используют
@@ -1219,7 +1259,7 @@ def cmd_apply(args):
             (
                 ex
                 for ex, fs in zip(t.examples, t.ex_functions, strict=True)
-                if (t.required_functions - CONDITIONS) <= fs
+                if covers(t.required_functions, fs)
             ),
             None,
         )

@@ -133,10 +133,43 @@ def test_roundtrip_rejects_epoxide_deoxygenation(run_apply):
     assert good in prods
 
 
-def test_roundtrip_off_lets_false_positive_through(run_apply):
-    """Контроль: без обратной проверки ложный кандидат появляется — проверка нужна."""
+def test_false_esterification_blocked_even_without_roundtrip(run_apply):
+    """Ложная «этерификация» ПО + AcOH -> пропилацетат (маппер увёл кислород
+    спирта) требует ухода OH с sp3-углерода без активации — её отсекает
+    решение 0012 даже без обратной проверки."""
     rows = run_apply("--purchasable", str(PURCHASABLE), "--no-roundtrip")
-    assert canon("CCCOC(C)=O") in products(rows)
+    assert canon("CCCOC(C)=O") not in products(rows)
+
+
+def test_roundtrip_off_lets_false_positive_through(tmp_path):
+    """Контроль решения 0002 на реальном шаблоне T00277 (нитрил + этилендиамин ->
+    имидазолин): прямой шаблон срабатывает и на N,N-диметилэтилендиамин и
+    теряет метилы; ловит это только обратная проверка."""
+    templates = ROOT / "tests" / "regression" / "roundtrip_templates.jsonl"
+    inputs = write_inputs(
+        tmp_path / "in.csv",
+        [("S8", "S1SSSSSSS1"), ("диамин", "CN(C)CCN"), ("нитрил", "N#Cc1cccc(Br)c1")],
+    )
+    wrong = canon("Brc1cccc(C2=NCCN2)c1")
+    found = {}
+    for flag in ("", "--no-roundtrip"):
+        out = tmp_path / f"c{flag}.csv"
+        main(
+            ["apply", "--templates", str(templates), "--inputs", str(inputs), "--internal-only"]
+            + [
+                "--min-count",
+                "1",
+                "--jobs",
+                "1",
+                "--out",
+                str(out),
+                "--report",
+                str(tmp_path / "r.md"),
+            ]
+            + ([flag] if flag else [])
+        )
+        found[flag] = wrong in {r["product"] for r in csv.DictReader(open(out, encoding="utf-8"))}
+    assert found == {"": False, "--no-roundtrip": True}
 
 
 def test_naoh_participates_as_reagent(run_apply):
