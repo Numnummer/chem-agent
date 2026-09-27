@@ -34,6 +34,8 @@ import collections
 import csv
 import itertools
 import json
+import multiprocessing
+import os
 import re
 import signal
 import sys
@@ -177,6 +179,37 @@ def run_products(rxn, reactant_mols, max_products=200) -> set[str]:
 # ---------------------------------------------------------------------------
 
 
+def load_mapper(device: str):
+    """
+    RXNMapper на выбранном устройстве. RXNMapper сам берёт GPU, если он есть;
+    'cpu' — принудительно процессор; 'auto' — GPU, а если на нём нет памяти
+    (занят другой моделью), то процессор.
+    """
+    import torch
+    from rxnmapper import RXNMapper
+
+    def on_cpu():
+        available = torch.cuda.is_available
+        torch.cuda.is_available = lambda: False  # RXNMapper выбирает устройство так
+        try:
+            return RXNMapper()
+        finally:
+            torch.cuda.is_available = available
+
+    if device == "cpu" or not torch.cuda.is_available():
+        mapper = on_cpu()
+    else:
+        try:
+            mapper = RXNMapper()
+        except Exception as e:  # torch.AcceleratorError / RuntimeError
+            if device == "cuda" or "out of memory" not in str(e):
+                raise
+            print("[map] на GPU не хватает памяти — разметка на CPU", file=sys.stderr)
+            mapper = on_cpu()
+    print(f"[map] устройство: {mapper.device}", file=sys.stderr)
+    return mapper
+
+
 def cmd_map(args):
     rows = read_csv(args.corpus)
     out_rows, todo = [], []
@@ -210,9 +243,7 @@ def cmd_map(args):
     )
 
     if todo:
-        from rxnmapper import RXNMapper
-
-        mapper = RXNMapper()
+        mapper = load_mapper(args.device)
         t0 = time.time()
         for start in range(0, len(todo), args.batch):
             chunk = todo[start : start + args.batch]
@@ -284,95 +315,154 @@ def prepare_for_extraction(mapped_rxn: str):
     )
 
 
-def cmd_extract(args):
+def extract_one(row: dict, timeout: int, no_intra: bool, max_reactants: int):
+    """
+    Шаблон из одной размеченной реакции. Чистая функция: не трогает общего
+    состояния, поэтому реакции можно обрабатывать в разных процессах.
+    Возвращает ("extracted", данные) или (причина_пропуска, None).
+    """
     from rdchiral.template_extractor import extract_from_reaction
 
+    prepared = prepare_for_extraction(row["mapped_rxn"]) if row.get("mapped_rxn") else None
+    if prepared is None:
+        return "skip_unparsable", None
+    reac_m, prod_m, reac_plain, prod_plain, spectators, solvents = prepared
+    if None in reac_plain or prod_plain is None:
+        return "skip_unparsable", None
+
+    signal.alarm(timeout)
+    try:
+        t = extract_from_reaction({"reactants": reac_m, "products": prod_m, "_id": row["id"]})
+    except Timeout:
+        return "skip_timeout", None
+    except Exception:
+        return "skip_error", None
+    finally:
+        signal.alarm(0)
+
+    if not t or "reactants" not in t or not t.get("products"):
+        return "skip_no_template", None
+    if t.get("intra_only") and no_intra:
+        return "skip_intra", None
+
+    forward = f"{t['reactants']}>>{t['products']}"
+    rxn = AllChem.ReactionFromSmarts(forward)
+    n_slots = rxn.GetNumReactantTemplates()
+    if n_slots > max_reactants:
+        return "skip_too_many_reactants", None
+
+    # Самопроверка: прямой шаблон на исходных реагентах должен дать
+    # записанный основной продукт (перебираем порядок реагентов по слотам).
+    mols = [Chem.MolFromSmiles(s) for s in reac_plain]
+    ok = False
+    for combo in itertools.permutations(mols, n_slots) if len(mols) >= n_slots else []:
+        if prod_plain in run_products(rxn, combo):
+            ok = True
+            break
+
+    return "extracted", {
+        "forward": forward,
+        "retro": t["reaction_smarts"],
+        "n_reactants": n_slots,
+        "necessary_reagent": t.get("necessary_reagent", ""),
+        "trusted": row["_trusted"],
+        "ok": ok,
+        "example": {
+            "id": row["id"],
+            "reactants": reac_plain,
+            "product": prod_plain,
+            "spectators": spectators,
+            "agents": ".".join(a for a in [row.get("agents", "")] + solvents if a),
+            "source": row.get("source", ""),
+            "selfcheck": ok,
+        },
+    }
+
+
+# Параллельная обработка: процессы создаются через fork и получают состояние
+# (аргументы, шаблоны, пул веществ) из глобальной переменной, а не через pickle —
+# объекты RDKit/rdchiral не сериализуются.
+_WORKER_STATE: dict = {}
+
+
+def n_jobs(requested: int) -> int:
+    """0 — все ядра. Без fork (Windows) — один процесс: там и SIGALRM нет."""
+    if "fork" not in multiprocessing.get_all_start_methods():
+        return 1
+    return requested if requested > 0 else (os.cpu_count() or 1)
+
+
+def parallel_map(func, n_items: int, jobs: int):
+    """func(i) для i in range(n_items); результаты — в исходном порядке."""
+    if jobs <= 1 or n_items < 2:
+        return map(func, range(n_items))
+    pool = multiprocessing.get_context("fork").Pool(jobs)
+    chunk = max(1, n_items // (jobs * 16))
+    return _closing_imap(pool, func, n_items, chunk)
+
+
+def _closing_imap(pool, func, n_items, chunk):
+    try:
+        yield from pool.imap(func, range(n_items), chunksize=chunk)
+    finally:
+        pool.terminate()
+
+
+def _extract_worker(i: int):
+    s = _WORKER_STATE
+    return extract_one(s["rows"][i], s["timeout"], s["no_intra"], s["max_reactants"])
+
+
+def _apply_worker(i: int):
+    s = _WORKER_STATE
+    nt = len(s["templates"])
+    return s["unit"](s["active"][i // nt], s["templates"][i % nt], s["level"])
+
+
+def cmd_extract(args):
     trusted_paths = set(args.trusted or [])
     rows = []
     for path in args.mapped:
         for row in read_csv(path):
             row["_trusted"] = path in trusted_paths
             rows.append(row)
-    signal.signal(signal.SIGALRM, _alarm)
+    signal.signal(signal.SIGALRM, _alarm)  # обработчик наследуется процессами при fork
 
     templates: dict[str, dict] = {}
     stats = collections.Counter()
+    jobs = n_jobs(args.jobs)
+    print(f"[extract] процессов: {jobs}", file=sys.stderr)
+    _WORKER_STATE.update(
+        rows=rows, timeout=args.timeout, no_intra=args.no_intra, max_reactants=args.max_reactants
+    )
 
-    for n, row in enumerate(rows, 1):
-        prepared = prepare_for_extraction(row["mapped_rxn"]) if row.get("mapped_rxn") else None
-        if prepared is None:
-            stats["skip_unparsable"] += 1
+    # Результаты приходят в порядке строк: шаблоны, частоты и примеры
+    # собираются так же, как при последовательной обработке.
+    for n, (status, x) in enumerate(parallel_map(_extract_worker, len(rows), jobs), 1):
+        if n % 5000 == 0:
+            print(f"[extract] {n}/{len(rows)}; шаблонов: {len(templates)}", file=sys.stderr)
+        if status != "extracted":
+            stats[status] += 1
             continue
-        reac_m, prod_m, reac_plain, prod_plain, spectators, solvents = prepared
-        if None in reac_plain or prod_plain is None:
-            stats["skip_unparsable"] += 1
-            continue
-
-        signal.alarm(args.timeout)
-        try:
-            t = extract_from_reaction({"reactants": reac_m, "products": prod_m, "_id": row["id"]})
-        except Timeout:
-            stats["skip_timeout"] += 1
-            continue
-        except Exception:
-            stats["skip_error"] += 1
-            continue
-        finally:
-            signal.alarm(0)
-
-        if not t or "reactants" not in t or not t.get("products"):
-            stats["skip_no_template"] += 1
-            continue
-        if t.get("intra_only") and args.no_intra:
-            stats["skip_intra"] += 1
-            continue
-
-        forward = f"{t['reactants']}>>{t['products']}"
-        rxn = AllChem.ReactionFromSmarts(forward)
-        n_slots = rxn.GetNumReactantTemplates()
-        if n_slots > args.max_reactants:
-            stats["skip_too_many_reactants"] += 1
-            continue
-
-        # Самопроверка: прямой шаблон на исходных реагентах должен дать
-        # записанный основной продукт (перебираем порядок реагентов по слотам).
-        mols = [Chem.MolFromSmiles(s) for s in reac_plain]
-        ok = False
-        for combo in itertools.permutations(mols, n_slots) if len(mols) >= n_slots else []:
-            if prod_plain in run_products(rxn, combo):
-                ok = True
-                break
-
-        rec = templates.get(forward)
+        rec = templates.get(x["forward"])
         if rec is None:
-            rec = templates[forward] = {
-                "forward": forward,
-                "retro": t["reaction_smarts"],
-                "n_reactants": n_slots,
-                "necessary_reagent": t.get("necessary_reagent", ""),
+            rec = templates[x["forward"]] = {
+                "forward": x["forward"],
+                "retro": x["retro"],
+                "n_reactants": x["n_reactants"],
+                "necessary_reagent": x["necessary_reagent"],
                 "count": 0,
                 "selfcheck_pass": 0,
                 "examples": [],
                 "trusted": False,
             }
         rec["count"] += 1
-        rec["selfcheck_pass"] += int(ok)
-        rec["trusted"] = rec["trusted"] or row["_trusted"]
+        rec["selfcheck_pass"] += int(x["ok"])
+        rec["trusted"] = rec["trusted"] or x["trusted"]
         if len(rec["examples"]) < args.max_examples:
-            rec["examples"].append(
-                {
-                    "id": row["id"],
-                    "reactants": reac_plain,
-                    "product": prod_plain,
-                    "spectators": spectators,
-                    "agents": ".".join(a for a in [row.get("agents", "")] + solvents if a),
-                    "source": row.get("source", ""),
-                    "selfcheck": ok,
-                }
-            )
+            rec["examples"].append(x["example"])
         stats["extracted"] += 1
-        if n % 5000 == 0:
-            print(f"[extract] {n}/{len(rows)}; шаблонов: {len(templates)}", file=sys.stderr)
+    _WORKER_STATE.clear()
 
     ordered = sorted(templates.values(), key=lambda r: -r["count"])
     with open(args.out, "w", encoding="utf-8") as f:
@@ -586,69 +676,6 @@ def cmd_apply(args):
                 add(s, "vocab")
         return out[: args.max_partners]
 
-    results, rejected = [], []
-    stats = collections.defaultdict(collections.Counter)
-    seen = set()
-    made_by: dict[str, dict] = {}  # продукт -> первая реакция, его давшая
-
-    def emit(inp, t, combo, role, level, new_products, reagent=""):
-        """combo: [(smiles, source)], где source='input' — само соединение;
-        reagent — сопутствующий реагент (в продукт не входит)."""
-        smiles_combo = [s for s, _ in combo]
-        mols = [Chem.MolFromSmiles(s) for s in smiles_combo]
-        name = inp["name"]
-        for prod in run_products(t.rxn, mols):
-            if prod in smiles_combo:
-                continue
-            core = ".".join(sorted(smiles_combo)) + ">" + reagent + ">" + prod
-            if (name, core) in seen:
-                continue
-            seen.add((name, core))
-            rxn_smiles = ".".join(smiles_combo) + ">" + reagent + ">" + prod
-            if not args.no_roundtrip and not t.roundtrip(smiles_combo, prod):
-                stats[name]["rejected_roundtrip"] += 1
-                rejected.append(
-                    {"input_name": name, "template_id": t.id, "reaction_smiles": rxn_smiles}
-                )
-                continue
-            # Само входное вещество тоже участник: на стадиях ≥2 это
-            # промежуточный продукт, а не вещество исходного набора.
-            participants = smiles_combo + ([reagent] if reagent else [])
-            if all(frag_set(s) in user_frags for s in participants):
-                source = "internal"  # все участники — исходный набор
-            elif all(frag_set(s) in pool_frags for s in participants):
-                source = "internal+intermediate"
-            else:
-                source = (
-                    ",".join(sorted({src for _, src in combo if src not in ("input",)})) or "none"
-                )
-            ex = t.precedent
-            rec = {
-                "level": level,
-                "input_name": name,
-                "input_smiles": inp["canon"],
-                "role": role,
-                "reaction_key": core,
-                "reagent": reagent,
-                "type_key": t.type_key,
-                "template_id": t.id,
-                "template_count": t.count,
-                "partners": ".".join(s for s, src in combo if src != "input"),
-                "partner_source": source,
-                "product": prod,
-                "reaction_smiles": rxn_smiles,
-                "needs_counterion": Chem.GetFormalCharge(Chem.MolFromSmiles(prod)) != 0,
-                "precedent_id": ex["id"],
-                "precedent_rxn": ".".join(ex["reactants"]) + ">>" + ex["product"],
-                "precedent_source": ex.get("source") or NO_SOURCE,
-            }
-            results.append(rec)
-            stats[name]["reactions"] += 1
-            stats[name]["internal"] += int(source == "internal")
-            if prod not in pool and prod not in new_products:
-                new_products[prod] = rec
-                made_by.setdefault(prod, rec)
-
     def reagent_for(t: Template) -> str | None:
         """Реагент для шаблона, которому он обязателен: сначала ищем в пуле,
         вне --internal-only допускаем реагент из прецедента."""
@@ -660,36 +687,125 @@ def cmd_apply(args):
             return None
         return canon(".".join(t.examples[0]["spectators"]))
 
-    def expand(inp, level, new_products):
+    def unit(inp, t: Template, level: int):
+        """
+        Все кандидаты одной пары «вещество × шаблон» в порядке перебора.
+        Общего состояния не меняет (дедупликация и новые вещества — в merge),
+        поэтому пары считаются в разных процессах. Возвращает (счётчики,
+        события); событие — (ключ реакции, запись или None, отказ или None).
+        """
         X, FX = inp["mol"], frag_set(inp["canon"])
         name = inp["name"]
-        for t in templates:
-            # (а) вещество — реагент: его атомы входят в продукт
-            hit_slots = [i for i, s in enumerate(t.slots) if X.HasSubstructMatch(s)]
-            reagent = ""
-            if hit_slots and t.needs_reagent:
-                reagent = reagent_for(t)
-                if reagent is None:  # нужного реагента в наборе нет
-                    hit_slots = []
-            if hit_slots:
-                stats[name]["templates_as_reactant"] += 1
-            for i in hit_slots:
-                lists = [
-                    partners_for(t, j) if j != i else [(inp["canon"], "input")]
-                    for j in range(len(t.slots))
-                ]
-                for combo in itertools.islice(itertools.product(*lists), args.max_combos):
-                    emit(inp, t, list(combo), "reactant", level, new_products, reagent)
-            # (б) вещество — сопутствующий реагент (основание, окислитель):
-            # в прецедентах было, но в продукт не вошло
-            if FX and any(FX <= sp for sp in t.spectator_sets):
-                stats[name]["templates_as_reagent"] += 1
-                lists = [partners_for(t, j) for j in range(len(t.slots))]
-                for combo in itertools.islice(itertools.product(*lists), args.max_combos):
-                    emit(inp, t, list(combo), "reagent", level, new_products, inp["canon"])
+        counts = collections.Counter()
+        events = []
+        local_seen = set()
+
+        def emit(combo, role, reagent=""):
+            """combo: [(smiles, source)], где source='input' — само соединение;
+            reagent — сопутствующий реагент (в продукт не входит)."""
+            smiles_combo = [s for s, _ in combo]
+            mols = [Chem.MolFromSmiles(s) for s in smiles_combo]
+            for prod in run_products(t.rxn, mols):
+                if prod in smiles_combo:
+                    continue
+                core = ".".join(sorted(smiles_combo)) + ">" + reagent + ">" + prod
+                if core in local_seen:
+                    continue
+                local_seen.add(core)
+                rxn_smiles = ".".join(smiles_combo) + ">" + reagent + ">" + prod
+                if not args.no_roundtrip and not t.roundtrip(smiles_combo, prod):
+                    rej = {"input_name": name, "template_id": t.id, "reaction_smiles": rxn_smiles}
+                    events.append((core, None, rej))
+                    continue
+                # Само входное вещество тоже участник: на стадиях ≥2 это
+                # промежуточный продукт, а не вещество исходного набора.
+                participants = smiles_combo + ([reagent] if reagent else [])
+                if all(frag_set(s) in user_frags for s in participants):
+                    source = "internal"  # все участники — исходный набор
+                elif all(frag_set(s) in pool_frags for s in participants):
+                    source = "internal+intermediate"
+                else:
+                    source = (
+                        ",".join(sorted({src for _, src in combo if src not in ("input",)}))
+                        or "none"
+                    )
+                ex = t.precedent
+                rec = {
+                    "level": level,
+                    "input_name": name,
+                    "input_smiles": inp["canon"],
+                    "role": role,
+                    "reaction_key": core,
+                    "reagent": reagent,
+                    "type_key": t.type_key,
+                    "template_id": t.id,
+                    "template_count": t.count,
+                    "partners": ".".join(s for s, src in combo if src != "input"),
+                    "partner_source": source,
+                    "product": prod,
+                    "reaction_smiles": rxn_smiles,
+                    "needs_counterion": Chem.GetFormalCharge(Chem.MolFromSmiles(prod)) != 0,
+                    "precedent_id": ex["id"],
+                    "precedent_rxn": ".".join(ex["reactants"]) + ">>" + ex["product"],
+                    "precedent_source": ex.get("source") or NO_SOURCE,
+                }
+                events.append((core, rec, None))
+
+        # (а) вещество — реагент: его атомы входят в продукт
+        hit_slots = [i for i, s in enumerate(t.slots) if X.HasSubstructMatch(s)]
+        reagent = ""
+        if hit_slots and t.needs_reagent:
+            reagent = reagent_for(t)
+            if reagent is None:  # нужного реагента в наборе нет
+                hit_slots = []
+        if hit_slots:
+            counts["templates_as_reactant"] += 1
+        for i in hit_slots:
+            lists = [
+                partners_for(t, j) if j != i else [(inp["canon"], "input")]
+                for j in range(len(t.slots))
+            ]
+            for combo in itertools.islice(itertools.product(*lists), args.max_combos):
+                emit(list(combo), "reactant", reagent)
+        # (б) вещество — сопутствующий реагент (основание, окислитель):
+        # в прецедентах было, но в продукт не вошло
+        if FX and any(FX <= sp for sp in t.spectator_sets):
+            counts["templates_as_reagent"] += 1
+            lists = [partners_for(t, j) for j in range(len(t.slots))]
+            for combo in itertools.islice(itertools.product(*lists), args.max_combos):
+                emit(list(combo), "reagent", inp["canon"])
+        return counts, events
+
+    results, rejected = [], []
+    stats = collections.defaultdict(collections.Counter)
+    seen = set()
+    made_by: dict[str, dict] = {}  # продукт -> первая реакция, его давшая
+
+    def merge(inp, counts, events, new_products):
+        """Последовательная сборка в порядке перебора: первая пара, давшая
+        реакцию, решает её судьбу — как при обработке в одном процессе."""
+        name = inp["name"]
+        stats[name].update(counts)
+        for core, rec, rej in events:
+            if (name, core) in seen:
+                continue
+            seen.add((name, core))
+            if rec is None:
+                stats[name]["rejected_roundtrip"] += 1
+                rejected.append(rej)
+                continue
+            results.append(rec)
+            stats[name]["reactions"] += 1
+            stats[name]["internal"] += int(rec["partner_source"] == "internal")
+            prod = rec["product"]
+            if prod not in pool and prod not in new_products:
+                new_products[prod] = rec
+                made_by.setdefault(prod, rec)
 
     # Стадия 1 — исходные соединения; стадии 2..depth — только новые продукты
     # предыдущей стадии (реакции «старое + старое» уже перебраны).
+    jobs = n_jobs(args.jobs)
+    print(f"[apply] шаблонов: {len(templates)}; процессов: {jobs}", file=sys.stderr)
     frontier = [i for i in inputs]
     level_summary = []
     for level in range(1, args.depth + 1):
@@ -697,14 +813,24 @@ def cmd_apply(args):
         for inp in frontier:
             if inp["mol"] is None:
                 stats[inp["name"]]["not_a_molecule"] = 1
-                continue
-            expand(inp, level, new_products)
+        active = [inp for inp in frontier if inp["mol"] is not None]
+        nt = len(templates)
+        # Процессы создаются здесь, после обновления пула: fork видит его текущим.
+        _WORKER_STATE.update(unit=unit, active=active, templates=templates, level=level)
+        for k, (counts, events) in enumerate(parallel_map(_apply_worker, len(active) * nt, jobs)):
+            merge(active[k // nt], counts, events, new_products)
+        _WORKER_STATE.clear()
         level_summary.append(
             (
                 level,
                 len({r["reaction_key"] for r in results if r["level"] == level}),
                 len(new_products),
             )
+        )
+        print(
+            f"[apply] стадия {level}: реакций всего {len(results)}, новых веществ "
+            f"{len(new_products)} ({time.time() - t_start:.0f} с)",
+            file=sys.stderr,
         )
         for prod in new_products:
             m = Chem.MolFromSmiles(prod)
@@ -908,6 +1034,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     m.add_argument("--out", required=True)
     m.add_argument("--batch", type=int, default=32)
+    m.add_argument(
+        "--device",
+        choices=["auto", "cpu", "cuda"],
+        default="auto",
+        help="auto — GPU, при нехватке памяти CPU",
+    )
     m.set_defaults(func=cmd_map)
 
     e = sub.add_parser("extract", help="извлечение шаблонов")
@@ -922,6 +1054,7 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--max-reactants", type=int, default=3)
     e.add_argument("--max-examples", type=int, default=20)
     e.add_argument("--no-intra", action="store_true", help="отбросить внутримолекулярные")
+    e.add_argument("--jobs", type=int, default=0, help="процессов; 0 — все ядра")
     e.add_argument(
         "--trusted",
         nargs="*",
@@ -954,6 +1087,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="не пускать на следующую стадию продукты крупнее этого",
     )
     a.add_argument("--max-routes", type=int, default=15, help="маршрутов в отчёте")
+    a.add_argument("--jobs", type=int, default=0, help="процессов; 0 — все ядра")
     a.set_defaults(func=cmd_apply)
 
     return ap

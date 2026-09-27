@@ -27,6 +27,8 @@ def templates_path(tmp_path_factory) -> Path:
             manual,
             "--out",
             str(out),
+            "--jobs",  # параллельную ветку проверяет test_parallel_run_gives_identical_output
+            "1",
         ]
     )
     return out
@@ -52,6 +54,8 @@ def run_apply(templates_path, tmp_path_factory):
                 str(out),
                 "--report",
                 str(report),
+                "--jobs",
+                "1",
                 *extra,
             ]
         )

@@ -179,3 +179,40 @@ def test_candidate_shows_precedent_source(run_apply):
     assert all(r["precedent_source"] for r in rows)
     # демо-корпус синтетический, источников у него нет
     assert any(r["precedent_source"] == NO_SOURCE for r in rows)
+
+
+def test_parallel_run_gives_identical_output(tmp_path):
+    """Число процессов не влияет на результат: те же шаблоны, те же кандидаты
+    в том же порядке, тот же отчёт (кроме строки времени)."""
+    from conftest import FIXTURES, INPUTS
+
+    manual = str(FIXTURES / "manual_mapped.csv")
+    outs = {}
+    for jobs in ("1", "4"):
+        d = tmp_path / f"j{jobs}"
+        d.mkdir()
+        mapped = [str(FIXTURES / "corpus_mapped.csv"), manual]
+        main(
+            ["extract", "--mapped", *mapped, "--trusted", manual, "--out", str(d / "t.jsonl")]
+            + ["--jobs", jobs]
+        )
+        for mode, extra in (
+            ("open", ["--purchasable", str(PURCHASABLE)]),
+            ("net", ["--depth", "2"]),  # открытый режим, 2 стадии: ~800 реакций
+        ):
+            main(
+                ["apply", "--templates", str(d / "t.jsonl"), "--inputs", str(INPUTS)]
+                + ["--min-count", "1", "--jobs", jobs, *extra]
+                + ["--out", str(d / f"{mode}.csv"), "--report", str(d / f"{mode}.md")]
+            )
+        outs[jobs] = {
+            name: [
+                line
+                for line in (d / name).read_text(encoding="utf-8").splitlines()
+                if not line.startswith("- Время:")
+            ]
+            for name in ("t.jsonl", "open.csv", "open.md", "net.csv", "net.md")
+        }
+    for name in outs["1"]:
+        assert outs["1"][name] == outs["4"][name], name
+    assert len(outs["1"]["net.csv"]) > 100  # сравнение не на пустом выводе
