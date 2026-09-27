@@ -9,6 +9,7 @@
 import csv
 import json
 
+import pytest
 from conftest import INPUTS, PURCHASABLE, ROOT, write_inputs
 
 from chem_agent.template_engine import (
@@ -301,3 +302,34 @@ def test_utilities_are_available_partners(run_apply):
     assert all(r["partner_source"] == "internal" for r in hydration)
     # ресурсы не раскрываются как входы: у воды своих строк нет
     assert not any(r["input_smiles"] == "O" for r in rows)
+
+
+@pytest.mark.parametrize(
+    "product, name",
+    [
+        ("CCCCCCCCCCCCOS(=O)(=O)[O-]", "SDS: S8 -> SO2 -> SO3 -> сульфатирование -> NaOH"),
+        ("O=S(=O)([O-])CCO", "изэтионат: SO2 + NaOH -> NaHSO3 + ЭО"),
+        ("O=S([O-])([O-])=S", "тиосульфат: сульфит + S8"),
+        ("C=CCO", "аллиловый спирт из ПО"),
+    ],
+)
+def test_manual_library_routes_from_priority_set(run_apply, product, name):
+    """Ручная библиотека (R3, docs/manual-library-proposal.md): маршруты из
+    перечня ТЗ с водой и воздухом за 4 стадии."""
+    rows = run_apply("--depth", "4", "--internal-only", "--utilities", str(UTILITIES))
+    assert canon(product) in products(rows), name
+
+
+def test_type_key_ignores_charge_and_query_details():
+    """SO3 + H2O -> H2SO4 и SO3 + OH- -> HSO4- — одно превращение (MAN-S03,
+    MAN-S14): тип не должен зависеть от заряда и порядка уточнений в SMARTS.
+    Иначе разнообразие для критерия 2.1 завышается."""
+    water = (
+        "[O;D1;H0:1]=[S;H0;D3;+0:2](=[O;D1;H0:3])=[O;H0;D1;+0:4].[OH2;D0;+0:5]"
+        ">>[O;D1;H0:1]=[S;H0;D4;+0:2](=[O;D1;H0:3])(-[OH;D1;+0:5])-[OH;D1;+0:4]"
+    )
+    hydroxide = (
+        "[O;D1;H0:1]=[S;H0;D3;+0:2](=[O;D1;H0:3])=[O;H0;D1;+0:4].[OH-;D0:5]"
+        ">>[O-;H0;D1:5]-[S;H0;D4;+0:2](=[O;D1;H0:1])(=[O;D1;H0:3])-[OH;D1;+0:4]"
+    )
+    assert type_key(water) == type_key(hydroxide)

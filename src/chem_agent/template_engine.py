@@ -136,10 +136,22 @@ def type_key(forward: str) -> str:
     rxn = AllChem.ReactionFromSmarts(forward)
 
     def skel(m):
-        m = Chem.Mol(m)
+        # только элементы и связи: без разметки, H, степени, заряда и порядка
+        # уточнений в SMARTS (иначе одно превращение даёт разные ключи)
+        rw = Chem.RWMol()
         for a in m.GetAtoms():
-            a.SetAtomMapNum(0)
-        return Chem.MolToSmiles(m)
+            atom = Chem.Atom(a.GetAtomicNum())
+            atom.SetIsAromatic(a.GetIsAromatic())
+            atom.SetNoImplicit(True)
+            rw.AddAtom(atom)
+        for b in m.GetBonds():
+            bt = b.GetBondType()
+            if bt == Chem.BondType.UNSPECIFIED:
+                bt = Chem.BondType.SINGLE
+            rw.AddBond(b.GetBeginAtomIdx(), b.GetEndAtomIdx(), bt)
+        mol = rw.GetMol()
+        mol.UpdatePropertyCache(strict=False)
+        return Chem.MolToSmiles(mol)
 
     r = sorted(skel(rxn.GetReactantTemplate(i)) for i in range(rxn.GetNumReactantTemplates()))
     p = sorted(skel(rxn.GetProductTemplate(i)) for i in range(rxn.GetNumProductTemplates()))
@@ -1245,7 +1257,7 @@ def load_templates(path, min_count, min_selfcheck) -> list[Template]:
                     r["count"],
                     r["selfcheck_rate"],
                     r["examples"],
-                    r.get("type_key") or type_key(r["forward"]),
+                    type_key(r["forward"]),  # пересчёт: ключ в файле мог быть старым
                 ).build()
             )
     return out

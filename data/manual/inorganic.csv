@@ -6,3 +6,14 @@ MAN-S04,S.O=O>>O=S=O,Процесс Клауса (термическая ста�
 MAN-S05,O=S(=O)(O)O.[Na+].[OH-]>>O=S(=O)([O-])O.[Na+],Нейтрализация серной кислоты,H2SO4 + NaOH -> NaHSO4 + H2O
 MAN-S06,O=S=O.[Na+].[OH-]>>O=S([O-])O.[Na+],Щелочная абсорбция SO2,SO2 + NaOH -> NaHSO3
 MAN-C01,O=C=O.[Na+].[OH-]>>O=C([O-])O.[Na+],Щелочная абсорбция CO2,CO2 + NaOH -> NaHCO3
+MAN-S07,CCCCCCCCCCCCO.O=S(=O)=O>>CCCCCCCCCCCCOS(=O)(=O)O,"Ullmann's Encyclopedia of Industrial Chemistry, «Surfactants»; Kirk-Othmer, «Sulfonation and Sulfation»",сульфатирование спиртов SO3 (плёночный реактор) — путь к SDS
+MAN-S08,CCCCCCCCCCCCOCCO.O=S(=O)=O>>CCCCCCCCCCCCOCCOS(=O)(=O)O,"Ullmann's Encyclopedia of Industrial Chemistry, «Surfactants»",сульфатирование этоксилата SO3 — путь к SLES; тот же тип, что MAN-S07 (доп. прецедент)
+MAN-S09,CCCCCCCCCCCCOS(=O)(=O)O.[Na+].[OH-]>>CCCCCCCCCCCCOS(=O)(=O)[O-].[Na+],"Ullmann's Encyclopedia of Industrial Chemistry, «Surfactants»",нейтрализация алкилсерной кислоты -> SDS; тип нейтрализации, как MAN-S05
+MAN-S10,O=S([O-])O.[Na+].C1CO1>>O=S(=O)([O-])CCO.[Na+],"Ullmann's Encyclopedia of Industrial Chemistry, «Sulfonic Acids, Aliphatic»",изэтионат натрия: NaHSO3 + ЭО
+MAN-S11,O=S([O-])[O-].[Na+].[Na+].S1SSSSSSS1>>O=S([O-])([O-])=S.[Na+].[Na+],"Ullmann's Encyclopedia of Industrial Chemistry, «Sulfites, Thiosulfates, and Dithionites»",тиосульфат натрия: Na2SO3 + S
+MAN-S12,O=S([O-])[O-].[Na+].[Na+].O=O>>O=S(=O)([O-])[O-].[Na+].[Na+],"Ullmann's Encyclopedia of Industrial Chemistry, «Sodium Sulfates»",окисление сульфита натрия кислородом до сульфата
+MAN-S13,O=S(=O)([O-])O.[Na+].[Na+].[OH-]>>O=S(=O)([O-])[O-].[Na+].[Na+],Учебник общей химии: нейтрализация гидросульфата,NaHSO4 + NaOH -> Na2SO4; тип нейтрализации, как MAN-S05 (доп. прецедент)
+MAN-S14,O=S(=O)=O.[Na+].[OH-]>>O=S(=O)([O-])O.[Na+],Учебник общей химии: поглощение SO3 щёлочью,SO3 + NaOH -> NaHSO4
+MAN-O01,C1CO1.O>>OCCO,"Ullmann's Encyclopedia of Industrial Chemistry, «Ethylene Glycol»",гидратация ЭО; тип есть в корпусе (T00494) — доп. промышленный прецедент
+MAN-O02,CC1CO1.O>>CC(O)CO,"Ullmann's Encyclopedia of Industrial Chemistry, «Propanediols»",гидратация ПО; тот же тип, что MAN-O01 (доп. прецедент)
+MAN-O03,CC1CO1>>C=CCO,"Ullmann's Encyclopedia of Industrial Chemistry, «Allyl Compounds»",изомеризация ПО в аллиловый спирт (Li3PO4)
