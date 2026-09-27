@@ -515,13 +515,25 @@ COUNTER_IONS = {"[Na+]", "[K+]", "[Li+]", "[Cl-]", "[Br-]", "[I-]", "[H+]"}
 # Функции сопутствующего реагента (решение 0009). Вещество набора может быть
 # сопутствующим реагентом шаблона, только если закрывает функции, которые
 # нужны шаблону по его прецедентам: NaOH не окисляет и не восстанавливает.
-BASE, OXIDANT, REDUCTANT = "base", "oxidant", "reductant"
+BASE, OXIDANT, REDUCTANT, ACID = "base", "oxidant", "reductant", "acid"
+FUNCTIONS = (BASE, OXIDANT, REDUCTANT, ACID)
 REQUIRED_SHARE = 0.5  # функция нужна шаблону, если есть в >50% прецедентов
 MIN_FUNCTION_SHARE = 0.25  # функция вещества должна встречаться в ≥25% прецедентов
 
 _BASE_SMILES = {"[OH-]", "O=C([O-])[O-]", "O=C([O-])O", "[NH2-]", "O=P([O-])([O-])[O-]"}
 _OXIDANT_SMILES = {"O=O", "S1SSSSSSS1", "[O-]Cl", "O=Cl[O-]", "OO"}
 _OXIDANT_METALS = {"Mn", "Cr", "Os", "Ru", "Se"}
+_ACID_SMILES = {
+    "Cl",  # HCl
+    "Br",  # HBr
+    "O=S(=O)(O)O",  # H2SO4
+    "CS(=O)(=O)O",  # MsOH
+    "Cc1ccc(S(=O)(=O)O)cc1",  # TsOH
+    "O=C(O)C(F)(F)F",  # TFA
+    "CC(=O)O",  # AcOH
+    "O=P(O)(O)O",  # H3PO4
+    "[H+]",
+}
 
 
 def _fragment_functions(smiles: str, has_hydride_carrier: bool) -> set[str]:
@@ -529,6 +541,8 @@ def _fragment_functions(smiles: str, has_hydride_carrier: bool) -> set[str]:
         return {BASE}
     if smiles in _OXIDANT_SMILES:
         return {OXIDANT}
+    if smiles in _ACID_SMILES:
+        return {ACID}
     if smiles == "[H][H]":
         return {REDUCTANT}
     if smiles == "[H-]":  # NaH — основание; LiAlH4, NaBH4 — восстановитель
@@ -575,6 +589,116 @@ def reagent_functions(fragments) -> set[str]:
     return out
 
 
+# Электроотрицательность (Полинг) для степеней окисления атомов шаблона.
+_EN = {
+    1: 2.20,
+    3: 0.98,
+    5: 2.04,
+    6: 2.55,
+    7: 3.04,
+    8: 3.44,
+    9: 3.98,
+    11: 0.93,
+    12: 1.31,
+    13: 1.61,
+    14: 1.90,
+    15: 2.19,
+    16: 2.58,
+    17: 3.16,
+    19: 0.82,
+    29: 1.90,
+    30: 1.65,
+    34: 2.55,
+    35: 2.96,
+    50: 1.96,
+    53: 2.66,
+}
+_HETERO = {7, 8, 9, 15, 16, 17, 34, 35, 53}
+
+
+def _query_h_charge(atom) -> tuple[int | None, int]:
+    """Число H и заряд атома шаблона RDChiral ('[C&H2&D2&+0:4]'); H=None, если не задано."""
+    s = atom.GetSmarts()
+    if not s.startswith("["):
+        return None, 0
+    body = re.sub(r":\d+\]$", "", s).strip("[]")
+    h, q = None, 0
+    for tok in re.split(r"[&;]", body):
+        if re.fullmatch(r"H\d*", tok):
+            h = int(tok[1:] or 1)
+        elif m := re.fullmatch(r"([+-])(\d*)", tok):
+            q = (1 if m.group(1) == "+" else -1) * int(m.group(2) or 1)
+    return h, q
+
+
+def _ox_state(atom, h: int, q: int) -> float:
+    en = _EN.get(atom.GetAtomicNum())
+    if en is None:
+        return 0.0
+    # каждый H: -1 у атома электроотрицательнее водорода, +1 у менее электроотрицательного
+    ox = q - h * ((en > _EN[1]) - (en < _EN[1]))
+    for b in atom.GetBonds():
+        en_nb = _EN.get(b.GetOtherAtom(atom).GetAtomicNum(), en)
+        if en_nb > en:
+            ox += b.GetBondTypeAsDouble()
+        elif en_nb < en:
+            ox -= b.GetBondTypeAsDouble()
+    return ox
+
+
+def intrinsic_functions(forward: str) -> set[str]:
+    """
+    Какой реагент нужен самому превращению (R15, решение 0010), независимо от
+    того, что записано в прецедентах:
+      - размеченный фрагмент окисляется (сумма степеней окисления атомов
+        центра растёт), а окислителя в шаблоне нет — нужен окислитель;
+        окислителем в шаблоне считается связь гетероатом–гетероатом
+        (O2, SO3, S8, Br2, HNO3);
+      - восстанавливается, а восстановителя (B, Al, Si, металл, H2) нет —
+        нужен восстановитель;
+      - атом становится менее отрицательным и получает H — нужна кислота;
+        наоборот — основание.
+    """
+    rxn = AllChem.ReactionFromSmarts(forward)
+
+    def mapped(n, get):
+        return {
+            a.GetAtomMapNum(): a for i in range(n) for a in get(i).GetAtoms() if a.GetAtomMapNum()
+        }
+
+    reac = mapped(rxn.GetNumReactantTemplates(), rxn.GetReactantTemplate)
+    prod = mapped(rxn.GetNumProductTemplates(), rxn.GetProductTemplate)
+    delta, need = 0.0, set()
+    for k, ar in reac.items():
+        ap = prod.get(k)
+        if ap is None:
+            continue
+        (hr, qr), (hp, qp) = _query_h_charge(ar), _query_h_charge(ap)
+        if hr is None or hp is None:
+            continue
+        delta += _ox_state(ap, hp, qp) - _ox_state(ar, hr, qr)
+        if qp > qr and hp > hr:
+            need.add(ACID)
+        elif qp < qr and hp < hr:
+            need.add(BASE)
+    slots = [rxn.GetReactantTemplate(i) for i in range(rxn.GetNumReactantTemplates())]
+    has_oxidant = any(
+        b.GetBeginAtom().GetAtomicNum() in _HETERO and b.GetEndAtom().GetAtomicNum() in _HETERO
+        for m in slots
+        for b in m.GetBonds()
+    )
+    has_reductant = any(
+        a.GetAtomicNum() == 1 or (_EN.get(a.GetAtomicNum(), 9) < 2.1)
+        for m in slots
+        for a in m.GetAtoms()
+    )
+    if delta >= 1 and not has_oxidant:
+        need.add(OXIDANT)
+    elif delta <= -1 and not has_reductant:
+        need.add(REDUCTANT)
+    return need
+
+
 def frag_set(smiles: str) -> frozenset[str]:
     """Набор канонических фрагментов без противоионов: '[Na+].[OH-]' -> {'[OH-]'}."""
     out = set()
@@ -618,12 +742,13 @@ class Template:
         # сопутствующие вещества в прецедентах и какие из них шаблону нужны.
         ex_functions = [reagent_functions(ex.get("spectators", [])) for ex in self.examples]
         n_ex = max(1, len(ex_functions))
-        self.function_share = {
-            f: sum(f in fs for fs in ex_functions) / n_ex for f in (BASE, OXIDANT, REDUCTANT)
-        }
+        self.function_share = {f: sum(f in fs for fs in ex_functions) / n_ex for f in FUNCTIONS}
+        # Нужные функции: по прецедентам (>50%) и по самому превращению (R15).
+        self.intrinsic_functions = intrinsic_functions(self.forward)
         self.required_functions = {
             f for f, share in self.function_share.items() if share > REQUIRED_SHARE
-        }
+        } | self.intrinsic_functions
+        self.ex_functions = ex_functions
         # Прецедент для выдачи: первый пример со ссылкой на источник, иначе первый.
         self.precedent = next(
             (ex for ex in self.examples if ex.get("source") not in ("", None, NO_SOURCE)),
@@ -632,7 +757,9 @@ class Template:
         # Одномолекулярный шаблон, у которого во всех прецедентах был
         # сопутствующий реагент (нейтрализация, омыление, гидролиз): без этого
         # реагента превращение не идёт, и применять его «в пустоту» нельзя.
-        self.needs_reagent = (
+        # Шаблон, которому нужна функция реагента (окислитель, основание...),
+        # без такого реагента тоже не применяется.
+        self.needs_reagent = bool(self.required_functions) or (
             len(self.slots) == 1 and bool(self.spectator_sets) and all(self.spectator_sets)
         )
         return self
@@ -791,7 +918,18 @@ def cmd_apply(args):
                 return s
         if args.internal_only:
             return None
-        return canon(".".join(t.examples[0]["spectators"]))
+        # реагент из прецедента, закрывающего нужные функции
+        ex = next(
+            (
+                ex
+                for ex, fs in zip(t.examples, t.ex_functions, strict=True)
+                if t.required_functions <= fs
+            ),
+            None,
+        )
+        if ex is None and t.intrinsic_functions:
+            return None  # превращению нужен реагент, которого нет ни в наборе, ни в прецедентах
+        return canon(".".join((ex or t.examples[0])["spectators"]))
 
     def unit(inp, t: Template, level: int):
         """
