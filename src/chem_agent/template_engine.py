@@ -154,9 +154,13 @@ def _alarm(signum, frame):
     raise Timeout()
 
 
-def run_products(rxn, reactant_mols, max_products=200) -> set[str]:
-    """Прямой прогон шаблона; возвращает канонические SMILES продуктов."""
-    out = set()
+def run_products_traced(rxn, reactant_mols, max_products=200) -> dict[str, dict]:
+    """
+    Прямой прогон шаблона: {канонический SMILES продукта: {номер атома в
+    шаблоне: (номер реагента, индекс атома в нём)}} — откуда пришёл каждый
+    атом шаблона (для продукта берётся первое совпадение).
+    """
+    out: dict[str, dict] = {}
     try:
         product_sets = rxn.RunReactants(tuple(reactant_mols), max_products)
     except Exception:
@@ -169,8 +173,195 @@ def run_products(rxn, reactant_mols, max_products=200) -> set[str]:
             except Exception:
                 continue
             c = canon(smi)
-            if c:
-                out.add(c)
+            if c and c not in out:
+                out[c] = {
+                    a.GetIntProp("old_mapno"): (
+                        a.GetIntProp("react_idx"),
+                        a.GetIntProp("react_atom_idx"),
+                    )
+                    for a in p.GetAtoms()
+                    if a.HasProp("old_mapno")
+                }
+    return out
+
+
+def run_products(rxn, reactant_mols, max_products=200) -> set[str]:
+    """Прямой прогон шаблона; возвращает канонические SMILES продуктов."""
+    return set(run_products_traced(rxn, reactant_mols, max_products))
+
+
+# --- Хемоселективность (R17, решение 0010) ----------------------------------
+# Класс реагирующего атома в реальной молекуле и «сила» нуклеофила. Шаблон
+# радиуса 1 видит только ближайших соседей: [OH] кислоты для него — тот же
+# [OH], что у спирта, а амидный N — тот же N, что у амина.
+
+NUC_RANK = {
+    "thiol": 5,
+    "thiocarbonyl": 5,
+    "alkoxide": 4,
+    "amine": 4,
+    "aniline": 3,
+    "alcohol": 2,
+    "phenol": 2,
+    "aromatic_NH": 2,
+}
+_HALOGENS = {"F", "Cl", "Br", "I"}
+
+
+def _is_acyl_like(atom) -> bool:
+    """C(=O), C(=S), C(=N), S(=O), P(=O): соседний атом делает N амидом, O — кислотным."""
+    return atom.GetSymbol() in ("C", "S", "P") and any(
+        b.GetBondType() == Chem.BondType.DOUBLE
+        and b.GetOtherAtom(atom).GetSymbol() in ("O", "S", "N")
+        for b in atom.GetBonds()
+    )
+
+
+def _activated_aryl(mol, atom) -> bool:
+    """Арилгалогенид активирован для SNAr: гетероароматика или акцептор в кольце."""
+    rings = [r for r in mol.GetRingInfo().AtomRings() if atom.GetIdx() in r]
+    for ring in rings:
+        for i in ring:
+            a = mol.GetAtomWithIdx(i)
+            if a.GetSymbol() == "N" and a.GetIsAromatic():
+                return True
+            for n in a.GetNeighbors():
+                if n.GetIdx() in ring:
+                    continue
+                if n.GetSymbol() == "N" and n.GetFormalCharge() > 0:  # нитро
+                    return True
+                if n.GetSymbol() == "C" and any(
+                    b.GetBondType() == Chem.BondType.TRIPLE for b in n.GetBonds()
+                ):  # циано
+                    return True
+                if _is_acyl_like(n) or (
+                    n.GetSymbol() == "C"
+                    and sum(x.GetSymbol() == "F" for x in n.GetNeighbors()) == 3
+                ):
+                    return True
+    return False
+
+
+def atom_class(mol, idx: int) -> str | None:
+    """Класс атома реакционного центра: спирт, фенол, амин, амид, тиол, арилгалогенид..."""
+    a = mol.GetAtomWithIdx(idx)
+    sym, q, h, nbrs = a.GetSymbol(), a.GetFormalCharge(), a.GetTotalNumHs(), a.GetNeighbors()
+    double = any(b.GetBondType() == Chem.BondType.DOUBLE for b in a.GetBonds())
+    if sym == "S":
+        if double:
+            return "thiocarbonyl" if a.GetDegree() == 1 else "sulfonyl"
+        return "thiol" if (h or q < 0) else "sulfide"
+    if sym == "O":
+        if double:
+            return "carbonyl_O"
+        if any(_is_acyl_like(n) for n in nbrs):
+            return "acid_O" if (h or q < 0) else "ester_O"
+        if q < 0 and any(n.GetFormalCharge() > 0 for n in nbrs):
+            return "nitro_O"  # [O-] при [N+], N-оксид: не нуклеофил
+        if q < 0:
+            return "alkoxide"
+        if h:
+            if not nbrs:
+                return "water"
+            return "phenol" if any(n.GetIsAromatic() for n in nbrs) else "alcohol"
+        return "ether"
+    if sym == "N":
+        if a.GetIsAromatic():
+            return "aromatic_NH" if h else "aromatic_N"
+        if any(_is_acyl_like(n) for n in nbrs):
+            return "amide_N"
+        if q > 0:
+            return "ammonium_N"
+        if double or any(b.GetBondType() == Chem.BondType.TRIPLE for b in a.GetBonds()):
+            return "unsaturated_N"
+        if any(n.GetIsAromatic() for n in nbrs):
+            return "aniline" if h else "aryl_amine3"
+        return "amine" if h else "amine3"
+    if sym == "C" and a.GetIsAromatic() and any(n.GetSymbol() in _HALOGENS for n in nbrs):
+        return "aryl_X_activated" if _activated_aryl(mol, a) else "aryl_X"
+    return None
+
+
+def competitor_rank(mol, idx: int) -> int:
+    """Самый сильный нуклеофил молекулы, кроме атома idx (0 — нет)."""
+    best = 0
+    for a in mol.GetAtoms():
+        if a.GetIdx() != idx and a.GetSymbol() in ("N", "O", "S"):
+            best = max(best, NUC_RANK.get(atom_class(mol, a.GetIdx()), 0))
+    return best
+
+
+def changed_mapnos(rxn) -> set[int]:
+    """Номера атомов шаблона, у которых меняются H, заряд, степень или связи."""
+
+    def smarts(n, get):
+        # атом и его соседи: при замещении (Cl -> O у кольца) меняются соседи
+        return {
+            a.GetAtomMapNum(): (
+                re.sub(r":\d+\]$", "]", a.GetSmarts()),
+                sorted(
+                    (
+                        str(b.GetOtherAtom(a).GetAtomMapNum() or b.GetOtherAtom(a).GetSymbol()),
+                        b.GetSmarts(),
+                    )
+                    for b in a.GetBonds()
+                ),
+            )
+            for i in range(n)
+            for a in get(i).GetAtoms()
+            if a.GetAtomMapNum()
+        }
+
+    reac = smarts(rxn.GetNumReactantTemplates(), rxn.GetReactantTemplate)
+    prod = smarts(rxn.GetNumProductTemplates(), rxn.GetProductTemplate)
+    return {k for k, v in reac.items() if prod.get(k) != v}
+
+
+def heteroatom_migration(rxn) -> bool:
+    """
+    R16: в одной молекуле один углерод теряет связь с гетероатомом, а другой
+    получает, без изменения кратности связи между ними. Так выглядит ошибочная
+    запись корпуса (2-додеканол -> эфир 1-додеканола). Замещение (SN2, раскрытие
+    эпоксида) меняет гетероатом у того же углерода, присоединение по кратной
+    связи — только добавляет.
+    """
+
+    def carbons(n, get):
+        count, slot, bonds = {}, {}, {}
+        for i in range(n):
+            for a in get(i).GetAtoms():
+                k = a.GetAtomMapNum()
+                if not k or a.GetAtomicNum() != 6:
+                    continue
+                slot[k] = i
+                count[k] = sum(nb.GetAtomicNum() in _HETERO for nb in a.GetNeighbors())
+                for b in a.GetBonds():
+                    j = b.GetOtherAtom(a).GetAtomMapNum()
+                    if j:
+                        bonds[frozenset((k, j))] = b.GetBondTypeAsDouble()
+        return count, slot, bonds
+
+    rc, slot, rb = carbons(rxn.GetNumReactantTemplates(), rxn.GetReactantTemplate)
+    pc, _, pb = carbons(rxn.GetNumProductTemplates(), rxn.GetProductTemplate)
+    lose = [k for k in rc if k in pc and pc[k] < rc[k]]
+    gain = [k for k in rc if k in pc and pc[k] > rc[k]]
+    for a in lose:
+        for b in gain:
+            if slot[a] == slot[b] and rb.get(frozenset((a, b))) == pb.get(frozenset((a, b))):
+                return True
+    return False
+
+
+def center_info(rxn, reactant_mols, provenance: dict) -> dict:
+    """{номер атома: [класс, сила конкурента]} для атомов центра прецедента."""
+    out = {}
+    for k in changed_mapnos(rxn):
+        if k not in provenance:
+            continue
+        ri, ai = provenance[k]
+        cls = atom_class(reactant_mols[ri], ai)
+        if cls is not None:
+            out[str(k)] = [cls, competitor_rank(reactant_mols[ri], ai)]
     return out
 
 
@@ -350,14 +541,18 @@ def extract_one(row: dict, timeout: int, no_intra: bool, max_reactants: int):
     n_slots = rxn.GetNumReactantTemplates()
     if n_slots > max_reactants:
         return "skip_too_many_reactants", None
+    if heteroatom_migration(rxn):
+        return "skip_heteroatom_migration", None
 
     # Самопроверка: прямой шаблон на исходных реагентах должен дать
     # записанный основной продукт (перебираем порядок реагентов по слотам).
     mols = [Chem.MolFromSmiles(s) for s in reac_plain]
-    ok = False
+    ok, center = False, {}
     for combo in itertools.permutations(mols, n_slots) if len(mols) >= n_slots else []:
-        if prod_plain in run_products(rxn, combo):
+        traced = run_products_traced(rxn, combo)
+        if prod_plain in traced:
             ok = True
+            center = center_info(rxn, combo, traced[prod_plain])
             break
 
     return "extracted", {
@@ -375,6 +570,7 @@ def extract_one(row: dict, timeout: int, no_intra: bool, max_reactants: int):
             "agents": ".".join(a for a in [row.get("agents", "")] + solvents if a),
             "source": row.get("source", ""),
             "selfcheck": ok,
+            "center": center,  # классы атомов центра (R17)
         },
     }
 
@@ -749,6 +945,14 @@ class Template:
             f for f, share in self.function_share.items() if share > REQUIRED_SHARE
         } | self.intrinsic_functions
         self.ex_functions = ex_functions
+        # Классы атомов центра в прецедентах и самая сильная конкурирующая
+        # группа, при которой прецедент всё же шёл по этому центру (R17).
+        self.center_classes: dict[int, set] = collections.defaultdict(set)
+        self.max_competitor: dict[int, int] = collections.defaultdict(int)
+        for ex in self.examples:
+            for k, (cls, comp) in (ex.get("center") or {}).items():
+                self.center_classes[int(k)].add(cls)
+                self.max_competitor[int(k)] = max(self.max_competitor[int(k)], comp)
         # Прецедент для выдачи: первый пример со ссылкой на источник, иначе первый.
         self.precedent = next(
             (ex for ex in self.examples if ex.get("source") not in ("", None, NO_SOURCE)),
@@ -786,6 +990,27 @@ class Template:
         if not self.required_functions <= functions:
             return False
         return max(self.function_share[f] for f in functions) >= MIN_FUNCTION_SHARE
+
+    def selective(self, provenance: dict, mols) -> bool:
+        """
+        Хемоселективность (R17): реагирующий атом кандидата того же класса,
+        что в прецедентах (кислота — не спирт, амид — не амин, неактивированный
+        арилгалогенид — не активированный), и в молекуле нет более сильного
+        нуклеофила, чем реагирующий, если прецеденты такого не показывали.
+        """
+        for k, classes in self.center_classes.items():
+            if k not in provenance:
+                continue
+            ri, ai = provenance[k]
+            cls = atom_class(mols[ri], ai)
+            if cls not in classes:
+                return False
+            rank = NUC_RANK.get(cls)
+            if rank is not None:
+                comp = competitor_rank(mols[ri], ai)
+                if comp > rank and comp > self.max_competitor[k]:
+                    return False
+        return True
 
     def roundtrip(self, reactants: list[str], product: str) -> bool:
         """
@@ -861,6 +1086,8 @@ def cmd_apply(args):
     pool = {i["canon"]: i["mol"] for i in inputs if i["mol"] is not None}
     pool_level = {c: 0 for c in pool}
     pool_frags = {frag_set(c) for c in pool}
+    # каким шаблоном получено вещество пула (R18: шаблон не наращивает свой продукт)
+    made_template: dict[str, str] = {}
 
     # Словарь внешних партнёров: реагенты из прецедентов корпуса с частотами,
     # опционально — пересечение с покупаемыми (база экономического агента).
@@ -948,9 +1175,15 @@ def cmd_apply(args):
             """combo: [(smiles, source)], где source='input' — само соединение;
             reagent — сопутствующий реагент (в продукт не входит)."""
             smiles_combo = [s for s, _ in combo]
+            if any(made_template.get(s) == t.id for s in smiles_combo):
+                counts["skipped_own_product"] += 1  # олигомеры: C12E1 -> C12E2 -> ...
+                return
             mols = [Chem.MolFromSmiles(s) for s in smiles_combo]
-            for prod in run_products(t.rxn, mols):
+            for prod, provenance in run_products_traced(t.rxn, mols).items():
                 if prod in smiles_combo:
+                    continue
+                if not t.selective(provenance, mols):
+                    counts["rejected_selectivity"] += 1
                     continue
                 core = ".".join(sorted(smiles_combo)) + ">" + reagent + ">" + prod
                 if core in local_seen:
@@ -1081,6 +1314,7 @@ def cmd_apply(args):
             m = Chem.MolFromSmiles(prod)
             if m is not None and m.GetNumHeavyAtoms() <= args.max_heavy_atoms:
                 pool[prod], pool_level[prod] = m, level
+                made_template[prod] = new_products[prod]["template_id"]
                 pool_frags.add(frag_set(prod))
         frontier = [
             {"name": f"[стадия {level}] {p}", "canon": p, "mol": pool[p]}

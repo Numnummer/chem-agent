@@ -234,3 +234,14 @@ def test_parallel_run_gives_identical_output(tmp_path):
     for name in outs["1"]:
         assert outs["1"][name] == outs["4"][name], name
     assert len(outs["1"]["net.csv"]) > 100  # сравнение не на пустом выводе
+
+
+def test_template_not_reapplied_to_its_own_product(run_apply):
+    """R18: этоксилирование даёт C12E1, но не наращивает C12E2, C12E3...
+    (степень алкоксилирования — параметр процесса, а не новая реакция).
+    Маршрут SLES (разные шаблоны на каждой стадии) при этом сохраняется."""
+    rows = run_apply("--depth", "4", "--internal-only")
+    prods = products(rows)
+    assert canon("CCCCCCCCCCCCOCCO") in prods
+    assert canon("CCCCCCCCCCCCOCCOCCO") not in prods
+    assert canon("CCCCCCCCCCCCOCCOS(=O)(=O)[O-]") in prods

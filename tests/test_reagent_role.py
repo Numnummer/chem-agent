@@ -209,3 +209,143 @@ def test_reagent_must_cover_intrinsic_function():
     t_red = Template("T", hydrogenation, hydrogenation, 2, 1.0, [ex], "k").build()
     assert not t_ox.can_be_reagent(NAOH, naoh)
     assert not t_red.can_be_reagent("O=O", o2)
+
+
+# --- R17: хемоселективность ---------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "smiles, atom_symbol, expected",
+    [
+        ("CC(=O)O", "O", {"acid_O", "carbonyl_O"}),
+        ("CCO", "O", {"alcohol"}),
+        ("Oc1ccccc1", "O", {"phenol"}),
+        ("CC(N)=O", "N", {"amide_N"}),
+        ("CN", "N", {"amine"}),
+        ("Nc1ccccc1", "N", {"aniline"}),
+        ("CCS", "S", {"thiol"}),
+        ("NC(N)=S", "N", {"amide_N"}),  # тиомочевина: N не аминный
+    ],
+)
+def test_atom_class(smiles, atom_symbol, expected):
+    from rdkit import Chem
+
+    from chem_agent.template_engine import atom_class
+
+    m = Chem.MolFromSmiles(smiles)
+    classes = {atom_class(m, a.GetIdx()) for a in m.GetAtoms() if a.GetSymbol() == atom_symbol}
+    assert classes == expected
+
+
+@pytest.mark.parametrize(
+    "smiles, expected",
+    [
+        ("Clc1ccc(O)cc1", "aryl_X"),  # строка 48 ревью full-v1: SNAr без активации
+        ("O=[N+]([O-])c1ccc(Cl)c([N+](=O)[O-])c1", "aryl_X_activated"),
+        ("Clc1ccccn1", "aryl_X_activated"),
+    ],
+)
+def test_aryl_halide_activation(smiles, expected):
+    from rdkit import Chem
+
+    from chem_agent.template_engine import atom_class
+
+    m = Chem.MolFromSmiles(smiles)
+    c = next(a for a in m.GetAtoms() if any(n.GetSymbol() == "Cl" for n in a.GetNeighbors()))
+    assert atom_class(m, c.GetIdx()) == expected
+
+
+ALKOXYLATION = (
+    "[C:1]-[OH;D1;+0:2].[C:3]1-[CH2;D2;+0:4]-[O;H0;D2;+0:5]-1"
+    ">>[C:1]-[O;H0;D2;+0:2]-[CH2;D2;+0:4]-[C:3]-[OH;D1;+0:5]"
+)
+
+
+@pytest.mark.parametrize(
+    "alcohol, allowed, why",
+    [
+        ("CCCCCCCCCCCCO", True, "спирт, как в прецедентах"),
+        ("OCCO", True, "вторая OH — равный конкурент, не сильнее"),
+        ("CC(=O)O", False, "OH кислоты — не спирт (строка 40 ревью full-v1)"),
+        ("OCCS", False, "SH сильнее OH (строка 32 ревью full-v2)"),
+        ("NCCO", False, "алифатический NH2 сильнее OH"),
+    ],
+)
+def test_alkoxylation_selectivity(alcohol, allowed, why):
+    from rdkit import Chem
+
+    from chem_agent.template_engine import Template, run_products_traced
+
+    ex = {
+        "id": "X",
+        "reactants": ["CCCCO", "C1CO1"],
+        "product": "CCCCOCCO",
+        "spectators": [],
+        "center": {"2": ["alcohol", 0], "5": ["ether", 0]},
+    }
+    t = Template("T", ALKOXYLATION, ALKOXYLATION, 5, 1.0, [ex], "k").build()
+    mols = [Chem.MolFromSmiles(alcohol), Chem.MolFromSmiles("C1CO1")]
+    traced = run_products_traced(t.rxn, mols)
+    assert traced, "шаблон должен совпасть структурно"
+    assert any(t.selective(p, mols) for p in traced.values()) == allowed, why
+
+
+def test_nitro_oxygen_is_not_a_nucleophile():
+    """[O-] нитрогруппы — не алкоксид: иначе любое нитросоединение «содержит
+    сильный нуклеофил» и верные реакции с ним отклоняются."""
+    from rdkit import Chem
+
+    from chem_agent.template_engine import atom_class, competitor_rank
+
+    m = Chem.MolFromSmiles("O=[N+]([O-])c1ccc(CO)cc1")
+    o_minus = next(a for a in m.GetAtoms() if a.GetFormalCharge() == -1)
+    assert atom_class(m, o_minus.GetIdx()) != "alkoxide"
+    alcohol_o = next(a for a in m.GetAtoms() if a.GetSymbol() == "O" and a.GetTotalNumHs() == 1)
+    assert competitor_rank(m, alcohol_o.GetIdx()) == 0
+
+
+def test_substitution_center_is_changed():
+    """SNAr: у атома кольца меняется сосед (Cl -> O), а не H и степень.
+    Такой атом — центр, его класс (активирован ли арилгалогенид) проверяется."""
+    from rdkit.Chem import AllChem
+
+    from chem_agent.template_engine import changed_mapnos
+
+    snar = (
+        "Cl-[c;H0;D3;+0:1](:[c:2]):[c:3].[C:4]-[OH;D1;+0:5]"
+        ">>[C:4]-[O;H0;D2;+0:5]-[c;H0;D3;+0:1](:[c:2]):[c:3]"
+    )
+    assert changed_mapnos(AllChem.ReactionFromSmarts(snar)) == {1, 5}
+
+
+# --- R16: миграция гетероатома — признак ошибочной записи корпуса -------------
+
+
+@pytest.mark.parametrize(
+    "forward, migrates, why",
+    [
+        (
+            "O-[CH;D3;+0:1](-[C:2])-[CH3;D1;+0:3].[O;D1;H0:4]=[C:5]-[OH;D1;+0:6]"
+            ">>[C:2]-[CH2;D2;+0:1]-[CH2;D2;+0:3]-[O;H0;D2;+0:6]-[C:5]=[O;D1;H0:4]",
+            True,
+            "T01991: 2-додеканол -> эфир 1-додеканола (строки 22, 28, 29 ревью full-v2)",
+        ),
+        (ALKOXYLATION, False, "раскрытие эпоксида: связь с O меняется у одного углерода"),
+        (
+            "Br-[CH2;D2;+0:1]-[C:2].[OH-;D0:3]>>[C:2]-[CH2;D2;+0:1]-[OH;D1;+0:3]",
+            False,
+            "SN2",
+        ),
+        (
+            "[C:1]=[CH2;D1;+0:2].[OH2;D0;+0:3]>>[C:1](-[OH;D1;+0:3])-[CH3;D1;+0:2]",
+            False,
+            "гидратация алкена: присоединение по двойной связи",
+        ),
+    ],
+)
+def test_heteroatom_migration(forward, migrates, why):
+    from rdkit.Chem import AllChem
+
+    from chem_agent.template_engine import heteroatom_migration
+
+    assert heteroatom_migration(AllChem.ReactionFromSmarts(forward)) == migrates, why
