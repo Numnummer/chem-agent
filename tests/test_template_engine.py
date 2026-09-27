@@ -76,6 +76,24 @@ def test_map_keeps_source_column(tmp_path):
     assert rows[0]["source"] == "US1"
 
 
+def test_template_count_is_distinct_precedents(tmp_path):
+    """R14: одна реакция, записанная дважды с разными растворителями или
+    реагентами (патент и его копия в 2naoh_dataset), — один прецедент.
+    Иначе фильтр --min-count 2 пропускает разовые ошибки разметки."""
+    rxn = "[CH3:1][OH:2].[CH2:3]1[CH2:4][O:5]1>>[CH3:1][O:2][CH2:3][CH2:4][OH:5]"
+    mapped = tmp_path / "m.csv"
+    with open(mapped, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["id", "mapped_rxn", "agents", "source"])
+        w.writerow(["A", rxn, "", "US1"])
+        w.writerow(["B", rxn.replace(">>", ".C1CCOC1.[Na+].[OH-]>>"), "", "без источника"])
+    out = tmp_path / "t.jsonl"
+    main(["extract", "--mapped", str(mapped), "--out", str(out), "--jobs", "1"])
+    (t,) = load_templates(out)
+    assert t["count"] == 1
+    assert [e["id"] for e in t["examples"]] == ["A"]
+
+
 def test_manual_templates_are_trusted(templates_path):
     trusted = [t for t in load_templates(templates_path) if t.get("trusted")]
     assert len(trusted) >= 7

@@ -455,18 +455,29 @@ def cmd_extract(args):
                 "selfcheck_pass": 0,
                 "examples": [],
                 "trusted": False,
+                "_seen": set(),
             }
+        rec["trusted"] = rec["trusted"] or x["trusted"]
+        stats["extracted"] += 1
+        # Частота — число разных прецедентов (реагирующие вещества + продукт),
+        # а не записей: одна реакция патента и её копия с другими растворителями
+        # (2naoh_dataset) — одно наблюдение (R14, решение 0009).
+        ex = x["example"]
+        precedent = (tuple(sorted(ex["reactants"])), ex["product"])
+        if precedent in rec["_seen"]:
+            stats["duplicate_precedent"] += 1
+            continue
+        rec["_seen"].add(precedent)
         rec["count"] += 1
         rec["selfcheck_pass"] += int(x["ok"])
-        rec["trusted"] = rec["trusted"] or x["trusted"]
         if len(rec["examples"]) < args.max_examples:
-            rec["examples"].append(x["example"])
-        stats["extracted"] += 1
+            rec["examples"].append(ex)
     _WORKER_STATE.clear()
 
     ordered = sorted(templates.values(), key=lambda r: -r["count"])
     with open(args.out, "w", encoding="utf-8") as f:
         for i, rec in enumerate(ordered, 1):
+            del rec["_seen"]
             rec["id"] = f"T{i:05d}"
             rec["type_key"] = type_key(rec["forward"])
             rec["selfcheck_rate"] = round(rec["selfcheck_pass"] / rec["count"], 3)
@@ -485,10 +496,11 @@ def cmd_extract(args):
         f"с частотой >=2: {sum(r['count'] >= 2 for r in ordered)}",
         file=sys.stderr,
     )
-    if stats["extracted"]:
+    n_precedents = sum(r["count"] for r in ordered)
+    if n_precedents:
         print(
-            f"[extract] самопроверка пройдена: {total_ok}/{stats['extracted']} "
-            f"({total_ok / stats['extracted']:.0%})",
+            f"[extract] разных прецедентов: {n_precedents}; самопроверка пройдена: "
+            f"{total_ok}/{n_precedents} ({total_ok / n_precedents:.0%})",
             file=sys.stderr,
         )
 
@@ -499,6 +511,68 @@ def cmd_extract(args):
 
 # Противоионы не считаем «реагентами» при сравнении наборов веществ.
 COUNTER_IONS = {"[Na+]", "[K+]", "[Li+]", "[Cl-]", "[Br-]", "[I-]", "[H+]"}
+
+# Функции сопутствующего реагента (решение 0009). Вещество набора может быть
+# сопутствующим реагентом шаблона, только если закрывает функции, которые
+# нужны шаблону по его прецедентам: NaOH не окисляет и не восстанавливает.
+BASE, OXIDANT, REDUCTANT = "base", "oxidant", "reductant"
+REQUIRED_SHARE = 0.5  # функция нужна шаблону, если есть в >50% прецедентов
+MIN_FUNCTION_SHARE = 0.25  # функция вещества должна встречаться в ≥25% прецедентов
+
+_BASE_SMILES = {"[OH-]", "O=C([O-])[O-]", "O=C([O-])O", "[NH2-]", "O=P([O-])([O-])[O-]"}
+_OXIDANT_SMILES = {"O=O", "S1SSSSSSS1", "[O-]Cl", "O=Cl[O-]", "OO"}
+_OXIDANT_METALS = {"Mn", "Cr", "Os", "Ru", "Se"}
+
+
+def _fragment_functions(smiles: str, has_hydride_carrier: bool) -> set[str]:
+    if smiles in _BASE_SMILES:
+        return {BASE}
+    if smiles in _OXIDANT_SMILES:
+        return {OXIDANT}
+    if smiles == "[H][H]":
+        return {REDUCTANT}
+    if smiles == "[H-]":  # NaH — основание; LiAlH4, NaBH4 — восстановитель
+        return {REDUCTANT} if has_hydride_carrier else {BASE}
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return set()
+    out = set()
+    for a in mol.GetAtoms():
+        sym, q = a.GetSymbol(), a.GetFormalCharge()
+        if sym in ("B", "Al") and (a.GetTotalNumHs() > 0 or q < 0):
+            out.add(REDUCTANT)  # борогидриды, алюмогидриды
+        elif sym in _OXIDANT_METALS or (sym == "I" and a.GetDegree() > 1):
+            out.add(OXIDANT)  # перманганат, хромовые, OsO4, Десс–Мартин, IBX
+        elif sym == "O" and any(n.GetSymbol() == "O" for n in a.GetNeighbors()):
+            out.add(OXIDANT)  # пероксиды, mCPBA
+        elif sym == "O" and q < 0 and a.GetDegree() <= 1:
+            nbr = a.GetNeighbors()
+            # алкоксид, но не карбоксилат и не сульфонат
+            if not nbr or all(b.GetBondType() != Chem.BondType.DOUBLE for b in nbr[0].GetBonds()):
+                out.add(BASE)
+        elif sym == "N" and q == 0 and not a.GetIsAromatic() and a.GetTotalNumHs() == 0:
+            if a.GetDegree() == 3 and all(n.GetSymbol() == "C" for n in a.GetNeighbors()):
+                if not any(
+                    b.GetBondType() == Chem.BondType.DOUBLE
+                    for n in a.GetNeighbors()
+                    for b in n.GetBonds()
+                ):
+                    out.add(BASE)  # третичный амин (Et3N, DIPEA), не амид
+        elif sym == "N" and a.GetIsAromatic() and a.GetTotalNumHs() == 0 and a.GetDegree() == 2:
+            if mol.GetNumHeavyAtoms() <= 8:
+                out.add(BASE)  # пиридин, лутидин
+    return out
+
+
+def reagent_functions(fragments) -> set[str]:
+    """Функции набора сопутствующих веществ одного прецедента (или одного вещества)."""
+    frags = [f for f in fragments if f]
+    mols = [m for f in frags if (m := Chem.MolFromSmiles(f)) is not None]
+    carrier = any(a.GetSymbol() in ("B", "Al") for m in mols for a in m.GetAtoms())
+    out = set()
+    for f in frags:
+        out |= _fragment_functions(f, carrier)
+    return out
 
 
 def frag_set(smiles: str) -> frozenset[str]:
@@ -540,6 +614,16 @@ class Template:
         except Exception:
             self.retro_rxn = None
         self.spectator_sets = [frag_set(".".join(ex.get("spectators", []))) for ex in self.examples]
+        # Какие функции (основание, окислитель, восстановитель) выполняли
+        # сопутствующие вещества в прецедентах и какие из них шаблону нужны.
+        ex_functions = [reagent_functions(ex.get("spectators", [])) for ex in self.examples]
+        n_ex = max(1, len(ex_functions))
+        self.function_share = {
+            f: sum(f in fs for fs in ex_functions) / n_ex for f in (BASE, OXIDANT, REDUCTANT)
+        }
+        self.required_functions = {
+            f for f, share in self.function_share.items() if share > REQUIRED_SHARE
+        }
         # Прецедент для выдачи: первый пример со ссылкой на источник, иначе первый.
         self.precedent = next(
             (ex for ex in self.examples if ex.get("source") not in ("", None, NO_SOURCE)),
@@ -552,6 +636,29 @@ class Template:
             len(self.slots) == 1 and bool(self.spectator_sets) and all(self.spectator_sets)
         )
         return self
+
+    def can_be_reagent(self, smiles: str, mol) -> bool:
+        """
+        Может ли вещество быть сопутствующим реагентом этого шаблона (решение
+        0009). Нужны все пять условий:
+        1. у вещества есть функция реагента (основание, окислитель, восстановитель);
+        2. оно само не подходит в слот шаблона — иначе это конкурирующий
+           реагент или избыток (ЭО рядом с ПО в «спирт + эпоксид»);
+        3. оно было сопутствующим хотя бы в одном прецеденте;
+        4. оно закрывает все функции, нужные шаблону (NaOH не заменит гидрид);
+        5. его функция встречается хотя бы в MIN_FUNCTION_SHARE прецедентов.
+        """
+        functions = reagent_functions(smiles.split("."))
+        if not functions:
+            return False
+        if any(mol.HasSubstructMatch(s) for s in self.slots):
+            return False
+        fs = frag_set(smiles)
+        if not fs or not any(fs <= sp for sp in self.spectator_sets):
+            return False
+        if not self.required_functions <= functions:
+            return False
+        return max(self.function_share[f] for f in functions) >= MIN_FUNCTION_SHARE
 
     def roundtrip(self, reactants: list[str], product: str) -> bool:
         """
@@ -679,9 +786,8 @@ def cmd_apply(args):
     def reagent_for(t: Template) -> str | None:
         """Реагент для шаблона, которому он обязателен: сначала ищем в пуле,
         вне --internal-only допускаем реагент из прецедента."""
-        for s in pool:
-            fs = frag_set(s)
-            if fs and any(fs <= sp for sp in t.spectator_sets):
+        for s, m in pool.items():
+            if t.can_be_reagent(s, m):
                 return s
         if args.internal_only:
             return None
@@ -694,7 +800,7 @@ def cmd_apply(args):
         поэтому пары считаются в разных процессах. Возвращает (счётчики,
         события); событие — (ключ реакции, запись или None, отказ или None).
         """
-        X, FX = inp["mol"], frag_set(inp["canon"])
+        X = inp["mol"]
         name = inp["name"]
         counts = collections.Counter()
         events = []
@@ -736,6 +842,9 @@ def cmd_apply(args):
                     "input_smiles": inp["canon"],
                     "role": role,
                     "reaction_key": core,
+                    # реакция без средней части: варианты с разными
+                    # сопутствующими реагентами — одна реакция (R13)
+                    "reaction_core": ".".join(sorted(smiles_combo)) + ">>" + prod,
                     "reagent": reagent,
                     "type_key": t.type_key,
                     "template_id": t.id,
@@ -768,8 +877,8 @@ def cmd_apply(args):
             for combo in itertools.islice(itertools.product(*lists), args.max_combos):
                 emit(list(combo), "reactant", reagent)
         # (б) вещество — сопутствующий реагент (основание, окислитель):
-        # в прецедентах было, но в продукт не вошло
-        if FX and any(FX <= sp for sp in t.spectator_sets):
+        # в прецедентах было, в продукт не вошло и выполняет нужную функцию
+        if t.can_be_reagent(inp["canon"], X):
             counts["templates_as_reagent"] += 1
             lists = [partners_for(t, j) for j in range(len(t.slots))]
             for combo in itertools.islice(itertools.product(*lists), args.max_combos):
@@ -795,8 +904,6 @@ def cmd_apply(args):
                 rejected.append(rej)
                 continue
             results.append(rec)
-            stats[name]["reactions"] += 1
-            stats[name]["internal"] += int(rec["partner_source"] == "internal")
             prod = rec["product"]
             if prod not in pool and prod not in new_products:
                 new_products[prod] = rec
@@ -823,7 +930,7 @@ def cmd_apply(args):
         level_summary.append(
             (
                 level,
-                len({r["reaction_key"] for r in results if r["level"] == level}),
+                len({r["reaction_core"] for r in results if r["level"] == level}),
                 len(new_products),
             )
         )
@@ -847,6 +954,10 @@ def cmd_apply(args):
 
     for inp in inputs:
         mine = [r for r in results if r["input_name"] == inp["name"]]
+        stats[inp["name"]]["reactions"] = len({r["reaction_core"] for r in mine})
+        stats[inp["name"]]["internal"] = len(
+            {r["reaction_core"] for r in mine if r["partner_source"] == "internal"}
+        )
         stats[inp["name"]]["types"] = len({r["type_key"] for r in mine})
         stats[inp["name"]]["internal_types"] = len(
             {r["type_key"] for r in mine if r["partner_source"] == "internal"}
@@ -858,6 +969,7 @@ def cmd_apply(args):
         "input_smiles",
         "role",
         "reaction_key",
+        "reaction_core",
         "reagent",
         "type_key",
         "template_id",
@@ -875,10 +987,10 @@ def cmd_apply(args):
     elapsed = time.time() - t_start
 
     # --- отчёт о покрытии ---
-    uniq = {r["reaction_key"] for r in results}
-    uniq_int = {r["reaction_key"] for r in results if r["partner_source"] == "internal"}
+    uniq = {r["reaction_core"] for r in results}
+    uniq_int = {r["reaction_core"] for r in results if r["partner_source"] == "internal"}
     uniq_net = {
-        r["reaction_key"]
+        r["reaction_core"]
         for r in results
         if r["partner_source"] in ("internal", "internal+intermediate")
     }
@@ -900,6 +1012,8 @@ def cmd_apply(args):
         "## По всему набору (так сформулирован критерий ТЗ 2.1)\n",
         f"- Уникальных реакций всего: **{len(uniq)}**; типов превращений: "
         f"**{len({r['type_key'] for r in results})}**",
+        f"- Вариантов с разными сопутствующими реагентами (считаются как одна реакция): "
+        f"{len({r['reaction_key'] for r in results})}",
         f"- Все участники — исходный набор: **{len(uniq_int)}**",
         f"- Все участники — исходный набор и полученные из него промежуточные: **{len(uniq_net)}**\n",
     ]
