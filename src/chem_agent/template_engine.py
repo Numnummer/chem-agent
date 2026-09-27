@@ -222,6 +222,9 @@ NUC_RANK = {
     "alcohol": 2,
     "phenol": 2,
     "aromatic_NH": 2,
+    "C_H_acidic": 1,  # альфа к C=O, C≡N, NO2, SO2, пиколил — депротонируется основанием
+    "C_H_plain": 0,  # неактивированный C–H: нужен BuLi/LDA, проигрывает любому OH/NH
+    "aryl_CH": 0,
 }
 _HALOGENS = {"F", "Cl", "Br", "I"}
 
@@ -236,27 +239,33 @@ def _is_acyl_like(atom) -> bool:
 
 
 def _activated_aryl(mol, atom) -> bool:
-    """Арилгалогенид активирован для SNAr: гетероароматика или акцептор в кольце."""
-    rings = [r for r in mol.GetRingInfo().AtomRings() if atom.GetIdx() in r]
-    for ring in rings:
-        for i in ring:
-            a = mol.GetAtomWithIdx(i)
-            if a.GetSymbol() == "N" and a.GetIsAromatic():
-                return True
-            for n in a.GetNeighbors():
-                if n.GetIdx() in ring:
-                    continue
-                if n.GetSymbol() == "N" and n.GetFormalCharge() > 0:  # нитро
+    """
+    Арилгалогенид активирован для SNAr: N кольца или сильный акцептор (NO2, CN,
+    C=O, SO2) в орто- или пара-положении к C–X. CF3 и мета-положение — нет.
+    """
+    for ring in mol.GetRingInfo().AtomRings():
+        if atom.GetIdx() not in ring:
+            continue
+        n_ring = len(ring)
+        pos = ring.index(atom.GetIdx())
+        for d in (
+            (1, 3) if n_ring == 6 else (1, 2)
+        ):  # орто, пара (в 5-членном — соседи и через один)
+            for i in (ring[(pos + d) % n_ring], ring[(pos - d) % n_ring]):
+                a = mol.GetAtomWithIdx(i)
+                if a.GetSymbol() == "N" and a.GetIsAromatic():
                     return True
-                if n.GetSymbol() == "C" and any(
-                    b.GetBondType() == Chem.BondType.TRIPLE for b in n.GetBonds()
-                ):  # циано
-                    return True
-                if _is_acyl_like(n) or (
-                    n.GetSymbol() == "C"
-                    and sum(x.GetSymbol() == "F" for x in n.GetNeighbors()) == 3
-                ):
-                    return True
+                for n in a.GetNeighbors():
+                    if n.GetIdx() in ring:
+                        continue
+                    if n.GetSymbol() == "N" and n.GetFormalCharge() > 0:  # нитро
+                        return True
+                    if n.GetSymbol() == "C" and any(
+                        b.GetBondType() == Chem.BondType.TRIPLE for b in n.GetBonds()
+                    ):  # циано
+                        return True
+                    if _is_acyl_like(n):  # C=O, SO2
+                        return True
     return False
 
 
@@ -297,7 +306,59 @@ def atom_class(mol, idx: int) -> str | None:
         return "amine" if h else "amine3"
     if sym == "C" and a.GetIsAromatic() and any(n.GetSymbol() in _HALOGENS for n in nbrs):
         return "aryl_X_activated" if _activated_aryl(mol, a) else "aryl_X"
+    if sym == "C" and h and all(n.GetSymbol() == "C" for n in nbrs):
+        # C–H-нуклеофил (R19): кислый (депротонируется основанием) или нет
+        if a.GetIsAromatic():
+            return "aryl_CH"
+        return "C_H_acidic" if _acidic_ch(a) else "C_H_plain"
     return None
+
+
+def _acidic_ch(atom) -> bool:
+    """C–H рядом с акцептором: C=O/C=N, C≡N, пиколил, либо тройная связь (алкин)."""
+    if any(b.GetBondType() == Chem.BondType.TRIPLE for b in atom.GetBonds()):
+        return True
+    for n in atom.GetNeighbors():
+        if _is_acyl_like(n) or any(
+            b.GetBondType() == Chem.BondType.TRIPLE and b.GetOtherAtom(n).GetSymbol() == "N"
+            for b in n.GetBonds()
+        ):
+            return True
+        if n.GetIsAromatic() and any(
+            x.GetSymbol() == "N" and x.GetIsAromatic() for x in n.GetNeighbors()
+        ):
+            return True  # 2-пиколил, 2-метилпиримидин
+    return False
+
+
+# Электрофилы вне центра (R19): перехватывают нуклеофил реакции. Шаблон с
+# нуклеофильным центром применяется к молекулам с такой группой, только если
+# прецеденты показывали, что она не мешает. Нуклеофилы-конкуренты проверяет
+# competitor_rank; сложные эфиры и альдегиды в этих условиях не конкурируют.
+_REACTIVE_GROUPS = {
+    name: Chem.MolFromSmarts(sma)
+    for name, sma in {
+        "acyl_halide": "[CX3](=O)[Cl,Br,I]",
+        "sulfonyl_halide": "[SX4](=O)(=O)[F,Cl,Br]",
+        "halohydrin": "[OX2H][CX4][CX4][Cl,Br,I]",
+        "epoxide": "C1OC1",
+        "isocyanate": "N=C=[O,S]",
+        "alkyl_halide": "[CX4][Cl,Br,I]",
+    }.items()
+}
+
+
+def reactive_groups(mol, exclude: set[int]) -> set[str]:
+    """Реакционные группы молекулы, не задевающие атомы центра exclude."""
+    out = set()
+    for name, patt in _REACTIVE_GROUPS.items():
+        if any(not set(match) & exclude for match in mol.GetSubstructMatches(patt)):
+            out.add(name)
+    for a in mol.GetAtoms():
+        if a.GetIdx() not in exclude and atom_class(mol, a.GetIdx()) == "aryl_X_activated":
+            if not any(n.GetIdx() in exclude for n in a.GetNeighbors()):
+                out.add("activated_aryl_halide")
+    return out
 
 
 def competitor_rank(mol, idx: int) -> int:
@@ -368,6 +429,16 @@ def heteroatom_migration(rxn) -> bool:
             if slot[a] == slot[b] and rb.get(frozenset((a, b))) == pb.get(frozenset((a, b))):
                 return True
     return False
+
+
+def slot_groups(rxn, reactant_mols, provenance: dict, changed: set[int] | None = None) -> dict:
+    """{номер слота: реакционные группы молекулы вне атомов центра}."""
+    changed = changed_mapnos(rxn) if changed is None else changed
+    out = {}
+    for ri, mol in enumerate(reactant_mols):
+        exclude = {ai for k, (r, ai) in provenance.items() if r == ri and k in changed}
+        out[ri] = reactive_groups(mol, exclude)
+    return out
 
 
 def center_info(rxn, reactant_mols, provenance: dict) -> dict:
@@ -565,12 +636,15 @@ def extract_one(row: dict, timeout: int, no_intra: bool, max_reactants: int):
     # Самопроверка: прямой шаблон на исходных реагентах должен дать
     # записанный основной продукт (перебираем порядок реагентов по слотам).
     mols = [Chem.MolFromSmiles(s) for s in reac_plain]
-    ok, center = False, {}
+    ok, center, groups = False, {}, {}
     for combo in itertools.permutations(mols, n_slots) if len(mols) >= n_slots else []:
         traced = run_products_traced(rxn, combo)
         if prod_plain in traced:
             ok = True
             center = center_info(rxn, combo, traced[prod_plain])
+            groups = {
+                str(ri): sorted(g) for ri, g in slot_groups(rxn, combo, traced[prod_plain]).items()
+            }
             break
 
     return "extracted", {
@@ -589,6 +663,7 @@ def extract_one(row: dict, timeout: int, no_intra: bool, max_reactants: int):
             "source": row.get("source", ""),
             "selfcheck": ok,
             "center": center,  # классы атомов центра (R17)
+            "groups": groups,  # реакционные группы вне центра по слотам (R19)
         },
     }
 
@@ -1048,6 +1123,13 @@ class Template:
             for k, (cls, comp) in (ex.get("center") or {}).items():
                 self.center_classes[int(k)].add(cls)
                 self.max_competitor[int(k)] = max(self.max_competitor[int(k)], comp)
+        # Реакционные группы вне центра, с которыми шаблон уже работал (R19).
+        self.changed = changed_mapnos(self.rxn)
+        self.group_info = any("groups" in ex for ex in self.examples)
+        self.slot_groups: dict[int, set] = collections.defaultdict(set)
+        for ex in self.examples:
+            for ri, g in (ex.get("groups") or {}).items():
+                self.slot_groups[int(ri)] |= set(g)
         # Прецедент для выдачи: первый пример со ссылкой на источник, иначе первый.
         self.precedent = next(
             (ex for ex in self.examples if ex.get("source") not in ("", None, NO_SOURCE)),
@@ -1114,6 +1196,15 @@ class Template:
                 comp = competitor_rank(mols[ri], ai)
                 if comp > rank and comp > self.max_competitor[k]:
                     return False
+        nucleophilic = any(
+            NUC_RANK.get(atom_class(mols[ri], ai), 0) >= 2
+            for k, (ri, ai) in provenance.items()
+            if k in self.center_classes
+        )
+        if self.group_info and nucleophilic:
+            for ri, groups in slot_groups(self.rxn, mols, provenance, self.changed).items():
+                if not groups <= self.slot_groups.get(ri, set()):
+                    return False  # незнакомая реакционная группа: конкурент
         return True
 
     def roundtrip(self, reactants: list[str], product: str) -> bool:

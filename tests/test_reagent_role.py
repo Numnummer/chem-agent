@@ -250,6 +250,9 @@ def test_atom_class(smiles, atom_symbol, expected):
         ("Clc1ccc(O)cc1", "aryl_X"),  # строка 48 ревью full-v1: SNAr без активации
         ("O=[N+]([O-])c1ccc(Cl)c([N+](=O)[O-])c1", "aryl_X_activated"),
         ("Clc1ccccn1", "aryl_X_activated"),
+        ("Brc1cccnc1", "aryl_X"),  # 3-галогенпиридин: N в мета-положении
+        ("Fc1ccccc1C(F)(F)F", "aryl_X"),  # CF3 — слабый акцептор
+        ("Fc1ccc(C#N)cc1", "aryl_X_activated"),  # CN в пара-положении
     ],
 )
 def test_aryl_halide_activation(smiles, expected):
@@ -258,7 +261,11 @@ def test_aryl_halide_activation(smiles, expected):
     from chem_agent.template_engine import atom_class
 
     m = Chem.MolFromSmiles(smiles)
-    c = next(a for a in m.GetAtoms() if any(n.GetSymbol() == "Cl" for n in a.GetNeighbors()))
+    c = next(
+        a
+        for a in m.GetAtoms()
+        if a.GetIsAromatic() and any(n.GetSymbol() in ("F", "Cl", "Br") for n in a.GetNeighbors())
+    )
     assert atom_class(m, c.GetIdx()) == expected
 
 
@@ -529,3 +536,64 @@ def test_catalyst_taken_from_agents_and_needs_consistency():
         "k",
     ).build()
     assert t.catalysts == []
+
+
+# --- R19: C–H-центры и незнакомые реакционные группы --------------------------
+
+
+@pytest.mark.parametrize(
+    "smiles, idx, expected",
+    [
+        ("CC#N", 0, "C_H_acidic"),  # альфа к нитрилу
+        ("CC(C)=O", 0, "C_H_acidic"),  # альфа к карбонилу
+        ("Cc1ccccn1", 0, "C_H_acidic"),  # пиколил
+        ("Cc1c[nH]c2ccccc12", 0, "C_H_plain"),  # CH3 при индоле — не кислый (строка 61)
+        ("c1ccccc1", 0, "aryl_CH"),
+    ],
+)
+def test_carbon_nucleophile_class(smiles, idx, expected):
+    from rdkit import Chem
+
+    from chem_agent.template_engine import atom_class
+
+    assert atom_class(Chem.MolFromSmiles(smiles), idx) == expected
+
+
+@pytest.mark.parametrize(
+    "smiles, group",
+    [
+        ("CC(=O)Cl", "acyl_halide"),
+        ("CS(=O)(=O)Cl", "sulfonyl_halide"),
+        ("OCC(Cl)C", "halohydrin"),
+        ("N#Cc1ccccc1F", "activated_aryl_halide"),  # строка 69 ревью full-v5
+        ("CC1CO1", "epoxide"),
+        ("CCBr", "alkyl_halide"),
+    ],
+)
+def test_reactive_groups(smiles, group):
+    from rdkit import Chem
+
+    from chem_agent.template_engine import reactive_groups
+
+    assert group in reactive_groups(Chem.MolFromSmiles(smiles), exclude=set())
+
+
+def test_reactive_group_of_center_itself_ignored():
+    """Группа, в которую входит атом центра, — сама реакция, а не конкурент."""
+    from rdkit import Chem
+
+    from chem_agent.template_engine import reactive_groups
+
+    m = Chem.MolFromSmiles("CC(=O)Cl")
+    assert "acyl_halide" not in reactive_groups(m, exclude={1})
+
+
+@pytest.mark.parametrize("smiles", ["CC(=O)OC", "CC=O", "Oc1ccccc1", "CC(=O)O"])
+def test_esters_aldehydes_nucleophiles_are_not_competing_electrophiles(smiles):
+    """Сложный эфир, альдегид, фенол, кислота не считаются посторонним
+    электрофилом (13 верных реакций стенда терялись из-за них)."""
+    from rdkit import Chem
+
+    from chem_agent.template_engine import reactive_groups
+
+    assert reactive_groups(Chem.MolFromSmiles(smiles), exclude=set()) == set()
