@@ -313,11 +313,15 @@ def test_utilities_are_available_partners(run_apply):
         ("C=CCO", "аллиловый спирт из ПО"),
     ],
 )
-def test_manual_library_routes_from_priority_set(run_apply, product, name):
+def test_manual_library_routes_from_priority_set(network4_with_utilities, product, name):
     """Ручная библиотека (R3, docs/manual-library-proposal.md): маршруты из
     перечня ТЗ с водой и воздухом за 4 стадии."""
-    rows = run_apply("--depth", "4", "--internal-only", "--utilities", str(UTILITIES))
-    assert canon(product) in products(rows), name
+    assert canon(product) in network4_with_utilities, name
+
+
+@pytest.fixture(scope="module")
+def network4_with_utilities(run_apply):
+    return products(run_apply("--depth", "4", "--internal-only", "--utilities", str(UTILITIES)))
 
 
 def test_type_key_ignores_charge_and_query_details():
