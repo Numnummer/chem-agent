@@ -1029,14 +1029,17 @@ class Template:
             f for f, share in self.function_share.items() if share > REQUIRED_SHARE
         } | self.intrinsic_functions
         self.ex_functions = ex_functions
-        # катализаторы прецедентов — для выдачи (условие процесса, не сырьё)
+        # Катализатор прецедентов — для выдачи (условие процесса, не сырьё).
+        # В корпусе он обычно в агентах; считается, только если есть хотя бы
+        # в половине прецедентов (разовый металл — не катализатор превращения).
         cat = collections.Counter(
             f
             for ex in self.examples
-            for f in set(ex.get("spectators", []))
-            if METAL_CATALYST in reagent_functions([f])
+            for f in set(ex.get("spectators", [])) | set(ex.get("agents", "").split("."))
+            if f and METAL_CATALYST in reagent_functions([f])
         )
-        self.catalysts = [f for f, _ in cat.most_common(2)]
+        n_ex = max(1, len(self.examples))
+        self.catalysts = [f for f, c in cat.most_common(2) if c / n_ex >= REQUIRED_SHARE]
         # Классы атомов центра в прецедентах и самая сильная конкурирующая
         # группа, при которой прецедент всё же шёл по этому центру (R17).
         self.center_classes: dict[int, set] = collections.defaultdict(set)

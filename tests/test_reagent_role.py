@@ -498,3 +498,34 @@ def test_hydroxyl_leaving_sp3_needs_activation():
 def test_epoxide_opening_and_esterification_need_no_activation():
     assert "activation" not in intrinsic_functions(ALKOXYLATION)
     assert "activation" not in intrinsic_functions(ESTERIFICATION)
+
+
+def test_catalyst_taken_from_agents_and_needs_consistency():
+    """Ревью full-v5, п. 4: катализатор в корпусе записан в агентах (Pd в
+    AB-1161), а не среди сопутствующих; разовая медь у 1 из 4 прецедентов
+    (бензилирование по Вильямсону) катализатором не считается."""
+    from chem_agent.template_engine import Template
+
+    def ex(i, agents):
+        return {"id": f"X{i}", "reactants": [], "product": "", "spectators": [], "agents": agents}
+
+    t = Template(
+        "T",
+        ESTERIFICATION,
+        ESTERIFICATION,
+        3,
+        1.0,
+        [ex(0, "O.[Pd]"), ex(1, "[Pd]"), ex(2, "")],
+        "k",
+    ).build()
+    assert t.catalysts == ["[Pd]"]
+    t = Template(
+        "T",
+        ESTERIFICATION,
+        ESTERIFICATION,
+        4,
+        1.0,
+        [ex(0, "[Cu+2]"), ex(1, ""), ex(2, "CCO"), ex(3, "")],
+        "k",
+    ).build()
+    assert t.catalysts == []
