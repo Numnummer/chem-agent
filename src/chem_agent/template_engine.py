@@ -901,6 +901,7 @@ def intrinsic_functions(forward: str) -> set[str]:
     reac = mapped(rxn.GetNumReactantTemplates(), rxn.GetReactantTemplate)
     prod = mapped(rxn.GetNumProductTemplates(), rxn.GetProductTemplate)
     delta, need = 0.0, set()
+    protonated = deprotonated = gains_h = loses_h = False
     for k, ar in reac.items():
         ap = prod.get(k)
         if ap is None:
@@ -909,10 +910,17 @@ def intrinsic_functions(forward: str) -> set[str]:
         if hr is None or hp is None:
             continue
         delta += _ox_state(ap, hp, qp) - _ox_state(ar, hr, qr)
-        if qp > qr and hp > hr:
-            need.add(ACID)
-        elif qp < qr and hp < hr:
-            need.add(BASE)
+        if ar.GetAtomicNum() in _HETERO:
+            protonated |= qp > qr and hp > hr
+            deprotonated |= qp < qr and hp < hr
+            gains_h |= hp > hr
+            loses_h |= hp < hr
+    # Протон, перешедший внутри реакции (OH бисульфита -> O раскрытого
+    # эпоксида), внешней кислоты или основания не требует.
+    if protonated and not loses_h:
+        need.add(ACID)
+    if deprotonated and not gains_h:
+        need.add(BASE)
     slots = [rxn.GetReactantTemplate(i) for i in range(rxn.GetNumReactantTemplates())]
     has_oxidant = any(
         b.GetBeginAtom().GetAtomicNum() in _HETERO and b.GetEndAtom().GetAtomicNum() in _HETERO
