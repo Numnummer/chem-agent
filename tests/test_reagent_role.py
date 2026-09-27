@@ -597,3 +597,108 @@ def test_esters_aldehydes_nucleophiles_are_not_competing_electrophiles(smiles):
     from chem_agent.template_engine import reactive_groups
 
     assert reactive_groups(Chem.MolFromSmiles(smiles), exclude=set()) == set()
+
+
+# --- Ревью full-v7: сопряжённые алкены и чувствительность C=C -----------------
+
+MICHAEL = (
+    "[#8:1]-[C:2](=[O;D1;H0:3])-[CH;D2;+0:4]=[CH2;D1;+0:5].[C:6]-[OH;D1;+0:7]"
+    ">>[#8:1]-[C:2](=[O;D1;H0:3])-[CH2;D2;+0:4]-[CH2;D2;+0:5]-[O;H0;D2;+0:7]-[C:6]"
+)
+SULFATION = (
+    "[C:1]-[OH;D1;+0:2].[O;D1;H0:3]=[S;H0;D3;+0:4](=[O;D1;H0:5])=[O;H0;D1;+0:6]"
+    ">>[C:1]-[O;H0;D2;+0:2]-[S;H0;D4;+0:4](=[O;D1;H0:3])(=[O;D1;H0:5])-[OH;D1;+0:6]"
+)
+PD_OXIDATION = (
+    "O=[O;H0;D1;+0:1].[C:2]-[CH2;D2;+0:3]-[OH;D1;+0:4]"
+    ">>[C:2]-[C;H0;D3;+0:3](-[O-;H0;D1:4])=[O;H0;D1;+0:1]"
+)
+
+
+@pytest.mark.parametrize(
+    "smiles, idx, expected",
+    [
+        ("C=CC(=O)[O-]", 0, "alkene_carboxylate"),
+        ("C=CC(=O)OC(C)(C)C", 0, "alkene_ester"),
+        ("C=CC(=O)OC(C)(C)C", 1, "alkene_ester"),
+        ("C=CCO", 0, "alkene"),
+    ],
+)
+def test_alkene_class_knows_conjugation(smiles, idx, expected):
+    from rdkit import Chem
+
+    from chem_agent.template_engine import atom_class
+
+    assert atom_class(Chem.MolFromSmiles(smiles), idx) == expected
+
+
+def _extracted(forward, precedent_reactants, precedent_product):
+    """Шаблон с классами центра и группами, как их записывает extract."""
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+
+    from chem_agent.template_engine import Template, center_info, run_products_traced, slot_groups
+
+    rxn = AllChem.ReactionFromSmarts(forward)
+    mols = [Chem.MolFromSmiles(s) for s in precedent_reactants]
+    prov = run_products_traced(rxn, mols)[canon(precedent_product)]
+    ex = {
+        "id": "X",
+        "reactants": precedent_reactants,
+        "product": precedent_product,
+        "spectators": [],
+        "center": center_info(rxn, mols, prov),
+        "groups": {str(k): sorted(v) for k, v in slot_groups(rxn, mols, prov).items()},
+    }
+    return Template("T", forward, forward, 3, 1.0, [ex], "k").build()
+
+
+def _allowed(t, reactants, product):
+    from rdkit import Chem
+
+    from chem_agent.template_engine import run_products_traced
+
+    mols = [Chem.MolFromSmiles(s) for s in reactants]
+    prov = run_products_traced(t.rxn, mols).get(canon(product))
+    assert prov is not None, "шаблон должен совпасть структурно"
+    return t.selective(prov, mols)
+
+
+def test_michael_ester_template_not_applied_to_carboxylate():
+    """Строки 16–23: прецедент — трет-бутилакрилат (эфир); анион акриловой
+    кислоты — слабый акцептор Михаэля, шаблон к нему не применяется."""
+    t = _extracted(MICHAEL, ["C=CC(=O)OC(C)(C)C", "CCO"], "CCOCCC(=O)OC(C)(C)C")
+    assert _allowed(t, ["C=CC(=O)OC", "CCCO"], "CCCOCCC(=O)OC")
+    assert not _allowed(t, ["C=CC(=O)[O-]", "CCCO"], "CCCOCCC(=O)[O-]")
+
+
+def test_allyl_double_bond_blocks_sulfation_and_oxidation():
+    """Строки 4, 11, 25: SO3 и O2/Pd атакуют аллильную C=C; прецеденты (додеканол,
+    этоксилат) её не содержали."""
+    sul = _extracted(SULFATION, ["CCCCCCCCCCCCO", "O=S(=O)=O"], "CCCCCCCCCCCCOS(=O)(=O)O")
+    assert _allowed(sul, ["CCCCO", "O=S(=O)=O"], "CCCCOS(=O)(=O)O")
+    assert not _allowed(sul, ["C=CCO", "O=S(=O)=O"], "C=CCOS(=O)(=O)O")
+    ox = _extracted(PD_OXIDATION, ["O=O", "CCOCCO"], "CCOCC(=O)[O-]")
+    assert not _allowed(ox, ["O=O", "C=CCOCCO"], "C=CCOCC(=O)[O-]")
+
+
+def test_allyl_alcohol_alkoxylation_still_allowed():
+    """Строки 2, 3 (OK): щелочное алкоксилирование аллилового спирта — C=C не мешает."""
+    t = _extracted(ALKOXYLATION, ["CCCCO", "C1CO1"], "CCCCOCCO")
+    assert _allowed(t, ["C=CCO", "C1CO1"], "C=CCOCCO")
+
+
+def test_primary_oh_preferred_over_secondary():
+    """Строка 9 ревью full-v7: SO3 сульфатирует первичный OH пропиленгликоля
+    быстрее вторичного; вторичный изомер — минорный, если прецеденты не
+    показывали такой селективности."""
+    t = _extracted(SULFATION, ["CCCCCCCCCCCCO", "O=S(=O)=O"], "CCCCCCCCCCCCOS(=O)(=O)O")
+    assert _allowed(t, ["CC(O)CO", "O=S(=O)=O"], "CC(O)COS(=O)(=O)O")
+    assert not _allowed(t, ["CC(O)CO", "O=S(=O)=O"], "CC(CO)OS(=O)(=O)O")
+
+
+def test_secondary_oh_allowed_when_precedent_shows_it():
+    """Если прецедент сам шёл по вторичному OH при свободном первичном
+    (алкоксилирование: оба изомера ДПГ), селективность не навязываем."""
+    t = _extracted(ALKOXYLATION, ["CC(O)CO", "C1CO1"], "CC(CO)OCCO")
+    assert _allowed(t, ["CC(O)CO", "CC1CO1"], "CC(CO)OCC(C)O")

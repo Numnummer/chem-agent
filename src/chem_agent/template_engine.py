@@ -318,12 +318,54 @@ def atom_class(mol, idx: int) -> str | None:
         return "amine" if h else "amine3"
     if sym == "C" and a.GetIsAromatic() and any(n.GetSymbol() in _HALOGENS for n in nbrs):
         return "aryl_X_activated" if _activated_aryl(mol, a) else "aryl_X"
+    if (
+        sym == "C"
+        and not a.GetIsAromatic()
+        and any(
+            b.GetBondType() == Chem.BondType.DOUBLE and b.GetOtherAtom(a).GetSymbol() == "C"
+            for b in a.GetBonds()
+        )
+    ):
+        return _alkene_class(a)
     if sym == "C" and h and all(n.GetSymbol() == "C" for n in nbrs):
         # C–H-нуклеофил (R19): кислый (депротонируется основанием) или нет
         if a.GetIsAromatic():
             return "aryl_CH"
         return "C_H_acidic" if _acidic_ch(a) else "C_H_plain"
     return None
+
+
+def _alkene_class(atom) -> str:
+    """
+    Углерод C=C с тем, с чем сопряжена связь: акцептор Михаэля на эфире —
+    не то же, что на анионе кислоты (слабый акцептор).
+    """
+    ene = [atom] + [
+        b.GetOtherAtom(atom)
+        for b in atom.GetBonds()
+        if b.GetBondType() == Chem.BondType.DOUBLE and b.GetOtherAtom(atom).GetSymbol() == "C"
+    ]
+    ids = {x.GetIdx() for x in ene}
+    for x in ene:
+        for n in x.GetNeighbors():
+            if n.GetIdx() in ids or n.GetSymbol() != "C":
+                continue
+            if any(b.GetBondType() == Chem.BondType.TRIPLE for b in n.GetBonds()):
+                return "alkene_nitrile"
+            if not _is_acyl_like(n):
+                continue
+            for b in n.GetBonds():
+                y = b.GetOtherAtom(n)
+                if b.GetBondType() != Chem.BondType.SINGLE or y.GetIdx() in ids:
+                    continue
+                if y.GetSymbol() == "O":
+                    if y.GetFormalCharge() < 0:
+                        return "alkene_carboxylate"
+                    return "alkene_acid" if y.GetTotalNumHs() else "alkene_ester"
+                if y.GetSymbol() == "N":
+                    return "alkene_amide"
+            return "alkene_ketone"
+    return "alkene"
 
 
 def _acidic_ch(atom) -> bool:
@@ -356,6 +398,8 @@ _REACTIVE_GROUPS = {
         "epoxide": "C1OC1",
         "isocyanate": "N=C=[O,S]",
         "alkyl_halide": "[CX4][Cl,Br,I]",
+        # не электрофил: проверяется только в окислительных и кислых условиях
+        "alkene": "[CX3;!a]=[CX3;!a]",
     }.items()
 }
 
@@ -373,12 +417,23 @@ def reactive_groups(mol, exclude: set[int]) -> set[str]:
     return out
 
 
-def competitor_rank(mol, idx: int) -> int:
+def nuc_rank(mol, idx: int, cls: str | None = None) -> float | None:
+    """Сила нуклеофила: класс, а у спирта ещё и замещённость углерода —
+    первичный OH реакционнее вторичного, вторичный — третичного."""
+    cls = atom_class(mol, idx) if cls is None else cls
+    rank = NUC_RANK.get(cls)
+    if rank is not None and cls == "alcohol":
+        c = mol.GetAtomWithIdx(idx).GetNeighbors()[0]
+        rank += 0.1 * (3 - sum(n.GetSymbol() == "C" for n in c.GetNeighbors()))
+    return rank
+
+
+def competitor_rank(mol, idx: int) -> float:
     """Самый сильный нуклеофил молекулы, кроме атома idx (0 — нет)."""
     best = 0
     for a in mol.GetAtoms():
         if a.GetIdx() != idx and a.GetSymbol() in ("N", "O", "S"):
-            best = max(best, NUC_RANK.get(atom_class(mol, a.GetIdx()), 0))
+            best = max(best, nuc_rank(mol, a.GetIdx()) or 0)
     return best
 
 
@@ -1135,6 +1190,18 @@ class Template:
             for k, (cls, comp) in (ex.get("center") or {}).items():
                 self.center_classes[int(k)].add(cls)
                 self.max_competitor[int(k)] = max(self.max_competitor[int(k)], comp)
+        # Окислительные или электрофильные условия (O2, SO3, кислота, металл):
+        # в них C=C вне центра не выживает, если прецеденты этого не показали.
+        self.oxidative = bool(
+            self.required_functions & {OXIDANT, ACID, METAL_CATALYST}
+            or self.catalysts
+            or any(
+                b.GetBeginAtom().GetAtomicNum() in _HETERO
+                and b.GetEndAtom().GetAtomicNum() in _HETERO
+                for m in self.slots
+                for b in m.GetBonds()
+            )
+        )
         # Реакционные группы вне центра, с которыми шаблон уже работал (R19).
         self.changed = changed_mapnos(self.rxn)
         self.group_info = any("groups" in ex for ex in self.examples)
@@ -1203,7 +1270,7 @@ class Template:
             cls = atom_class(mols[ri], ai)
             if cls not in classes:
                 return False
-            rank = NUC_RANK.get(cls)
+            rank = nuc_rank(mols[ri], ai, cls)
             if rank is not None:
                 comp = competitor_rank(mols[ri], ai)
                 if comp > rank and comp > self.max_competitor[k]:
@@ -1213,10 +1280,13 @@ class Template:
             for k, (ri, ai) in provenance.items()
             if k in self.center_classes
         )
-        if self.group_info and nucleophilic:
+        if self.group_info:
             for ri, groups in slot_groups(self.rxn, mols, provenance, self.changed).items():
-                if not groups <= self.slot_groups.get(ri, set()):
-                    return False  # незнакомая реакционная группа: конкурент
+                known = self.slot_groups.get(ri, set())
+                if nucleophilic and not (groups - {"alkene"}) <= known:
+                    return False  # незнакомый электрофил перехватит нуклеофил
+                if self.oxidative and "alkene" in groups and "alkene" not in known:
+                    return False  # C=C не переживёт SO3, O2, кислоту или металл
         return True
 
     def roundtrip(self, reactants: list[str], product: str) -> bool:
