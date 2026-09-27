@@ -349,3 +349,110 @@ def test_heteroatom_migration(forward, migrates, why):
     from chem_agent.template_engine import heteroatom_migration
 
     assert heteroatom_migration(AllChem.ReactionFromSmarts(forward)) == migrates, why
+
+
+# --- Функции реагента: кислоты Льюиса, катализаторы, окислитель по делу -------
+
+
+@pytest.mark.parametrize(
+    "spectators, expected",
+    [
+        (["Cl[Al](Cl)Cl"], {"acid"}),
+        (["[Al+3]", "[Cl-]", "[Cl-]", "[Cl-]"], {"acid"}),
+        (["[Al+3]", "[H-]", "[Li+]"], {"reductant"}),  # LiAlH4, не кислота Льюиса
+        (["FB(F)F"], {"acid"}),
+        (["[Pd]"], {"metal_catalyst"}),
+        (["[Pt]", "[Na+]", "[OH-]"], {"metal_catalyst", "base"}),
+    ],
+)
+def test_lewis_acids_and_catalysts(spectators, expected):
+    from chem_agent.template_engine import reagent_functions
+
+    assert reagent_functions(spectators) == expected
+
+
+FRIEDEL_CRAFTS = (
+    "Cl-[C;H0;D3;+0:1](-[C:2])=[O;D1;H0:3].[cH;D2;+0:4](:[c:5]):[c:6]"
+    ">>[C:2]-[C;H0;D3;+0:1](=[O;D1;H0:3])-[c;H0;D3;+0:4](:[c:5]):[c:6]"
+)
+ESTERIFICATION = (
+    "[C:1]-[C;H0;D3;+0:2](=[O;D1;H0:3])-[OH;D1;+0:4].[c:5]-[OH;D1;+0:6]"
+    ">>[C:1]-[C;H0;D3;+0:2](=[O;D1;H0:3])-[O;H0;D2;+0:6]-[c:5]"
+)
+
+
+def _template(forward, spectator_lists):
+    from chem_agent.template_engine import Template
+
+    exs = [
+        {"id": f"X{i}", "reactants": [], "product": "", "spectators": sp}
+        for i, sp in enumerate(spectator_lists)
+    ]
+    return Template("T", forward, forward, len(exs), 1.0, exs, "k").build()
+
+
+def test_naoh_not_reagent_where_lewis_acid_needed():
+    """Строка 47 ревью full-v3: ацилирование по Фриделю–Крафтсу — нужен
+    AlCl3; NaOH в прецедентах — только обработка."""
+    from rdkit import Chem
+
+    t = _template(FRIEDEL_CRAFTS, [["Cl[Al](Cl)Cl", "[Na+]", "[OH-]"]] * 3)
+    assert not t.can_be_reagent(NAOH, Chem.MolFromSmiles(NAOH))
+
+
+def test_oxidant_not_reagent_in_non_redox_reaction():
+    """Строка 54 ревью full-v3: этерификация не окисление — O2, записанный в
+    одном прецеденте из трёх (атмосфера), реагентом не становится."""
+    from rdkit import Chem
+
+    t = _template(ESTERIFICATION, [["O=O"], [], []])
+    assert not t.can_be_reagent("O=O", Chem.MolFromSmiles("O=O"))
+
+
+def test_consistent_oxidant_reagent_kept():
+    """Строка 21 ревью full-v1: S8 в 3 из 4 прецедентов (синтез имидазолинов) —
+    реагент по делу, хотя превращение формально не окислительное."""
+    from rdkit import Chem
+
+    t = _template(ESTERIFICATION, [[S8], [S8], [S8], []])
+    assert t.can_be_reagent(S8, Chem.MolFromSmiles(S8))
+
+
+def test_catalyst_does_not_block_and_is_reported():
+    """Катализатор — условие процесса, не сырьё: реакция не блокируется, а
+    катализатор из прецедентов указывается."""
+    t = _template(ESTERIFICATION, [["[Pt]"], ["[Pt]"], []])
+    assert not t.needs_reagent
+    assert t.catalysts == ["[Pt]"]
+
+
+def test_new_stereocenter_not_invented():
+    """Строки 33, 52 ревью full-v3: стереоцентр из шаблона не переносится на
+    атом, который в исходном веществе стереоцентром не был."""
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+
+    from chem_agent.template_engine import run_products_traced
+
+    reduction = AllChem.ReactionFromSmarts(
+        "[C:1]-[C;H0;D3;+0:2](-[C:3])=[O;H0;D1;+0:4]>>[C:1]-[C@H;D3;+0:2](-[C:3])-[OH;D1;+0:4]"
+    )
+    prods = run_products_traced(reduction, [Chem.MolFromSmiles("CCC(C)=O")], keep_new_stereo=False)
+    assert prods and not any("@" in p for p in prods)
+
+
+def test_new_stereocenter_kept_on_chiral_substrate():
+    """Строка 40 ревью full-v2 (OK): ене-реакция Шенка на стероиде — новый
+    стереоцентр задаётся хиральным каркасом, его не снимаем."""
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+
+    from chem_agent.template_engine import run_products_traced
+
+    reduction = AllChem.ReactionFromSmarts(
+        "[C:1]-[C;H0;D3;+0:2](-[C:3])=[O;H0;D1;+0:4]>>[C:1]-[C@H;D3;+0:2](-[C:3])-[OH;D1;+0:4]"
+    )
+    prods = run_products_traced(
+        reduction, [Chem.MolFromSmiles("C[C@H](O)CC(C)=O")], keep_new_stereo=False
+    )
+    assert any(p.count("@") == 2 for p in prods)

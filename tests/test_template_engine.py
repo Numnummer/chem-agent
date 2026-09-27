@@ -9,7 +9,7 @@
 import csv
 import json
 
-from conftest import INPUTS, PURCHASABLE, write_inputs
+from conftest import INPUTS, PURCHASABLE, ROOT, write_inputs
 
 from chem_agent.template_engine import (
     NO_SOURCE,
@@ -236,12 +236,35 @@ def test_parallel_run_gives_identical_output(tmp_path):
     assert len(outs["1"]["net.csv"]) > 100  # сравнение не на пустом выводе
 
 
-def test_template_not_reapplied_to_its_own_product(run_apply):
-    """R18: этоксилирование даёт C12E1, но не наращивает C12E2, C12E3...
-    (степень алкоксилирования — параметр процесса, а не новая реакция).
-    Маршрут SLES (разные шаблоны на каждой стадии) при этом сохраняется."""
-    rows = run_apply("--depth", "4", "--internal-only")
+def test_oligomer_series_limited_and_counted_once(run_apply, tmp_path):
+    """R18, решение 0011: шаблон наращивает свой продукт не больше 3 раз
+    (C12E1..C12E3, не C12E4); серия олигомеров в критерии 2.1 — одна реакция.
+    Маршрут SLES (разные шаблоны на каждой стадии) сохраняется."""
+    rows = run_apply("--depth", "5", "--internal-only")
     prods = products(rows)
-    assert canon("CCCCCCCCCCCCOCCO") in prods
-    assert canon("CCCCCCCCCCCCOCCOCCO") not in prods
+    c12e = ["CCCCCCCCCCCCO" + "CCO" * n for n in range(1, 5)]
+    assert [canon(p) in prods for p in c12e] == [True, True, True, False]
     assert canon("CCCCCCCCCCCCOCCOS(=O)(=O)[O-]") in prods
+    e3 = next(r for r in rows if r["product"] == canon(c12e[2]))
+    e1 = next(r for r in rows if r["product"] == canon(c12e[0]))
+    assert e3["series"] == e1["series"] and e3["repeat"] == "3"
+    assert len({r["series"] for r in rows}) < len({r["reaction_core"] for r in rows})
+
+
+UTILITIES = ROOT / "data" / "inputs" / "utilities.csv"
+
+
+def test_utilities_are_available_partners(run_apply):
+    """Решение 0011: вода и воздух — всегда доступные ресурсы (ТЗ: «доступные
+    ресурсы: электричество, вода, воздух»). ЭО + вода -> этиленгликоль."""
+    eg = canon("OCCO")
+    without = run_apply("--internal-only")
+    assert not any(
+        r["product"] == eg and "O" in r["reaction_smiles"].split(">")[0].split(".") for r in without
+    )
+    rows = run_apply("--internal-only", "--utilities", str(UTILITIES))
+    hydration = [r for r in rows if r["product"] == eg and r["partners"] == "O"]
+    assert hydration
+    assert all(r["partner_source"] == "internal" for r in hydration)
+    # ресурсы не раскрываются как входы: у воды своих строк нет
+    assert not any(r["input_smiles"] == "O" for r in rows)

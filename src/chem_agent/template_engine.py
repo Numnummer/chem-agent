@@ -154,7 +154,9 @@ def _alarm(signum, frame):
     raise Timeout()
 
 
-def run_products_traced(rxn, reactant_mols, max_products=200) -> dict[str, dict]:
+def run_products_traced(
+    rxn, reactant_mols, max_products=200, keep_new_stereo: bool = True
+) -> dict[str, dict]:
     """
     Прямой прогон шаблона: {канонический SMILES продукта: {номер атома в
     шаблоне: (номер реагента, индекс атома в нём)}} — откуда пришёл каждый
@@ -167,6 +169,22 @@ def run_products_traced(rxn, reactant_mols, max_products=200) -> dict[str, dict]
         return out
     for ps in product_sets:
         for p in ps:
+            if not keep_new_stereo:
+                # стереоцентр шаблона не переносим на ахиральный субстрат; у
+                # хирального субстрата новый центр задаётся каркасом — оставляем
+                for a in p.GetAtoms():
+                    if a.GetChiralTag() == Chem.ChiralType.CHI_UNSPECIFIED or not a.HasProp(
+                        "react_atom_idx"
+                    ):
+                        continue
+                    src_mol = reactant_mols[a.GetIntProp("react_idx")]
+                    src = src_mol.GetAtomWithIdx(a.GetIntProp("react_atom_idx"))
+                    achiral = all(
+                        x.GetChiralTag() == Chem.ChiralType.CHI_UNSPECIFIED
+                        for x in src_mol.GetAtoms()
+                    )
+                    if src.GetChiralTag() == Chem.ChiralType.CHI_UNSPECIFIED and achiral:
+                        a.SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)
             try:
                 Chem.SanitizeMol(p)
                 smi = Chem.MolToSmiles(p)
@@ -712,13 +730,20 @@ COUNTER_IONS = {"[Na+]", "[K+]", "[Li+]", "[Cl-]", "[Br-]", "[I-]", "[H+]"}
 # сопутствующим реагентом шаблона, только если закрывает функции, которые
 # нужны шаблону по его прецедентам: NaOH не окисляет и не восстанавливает.
 BASE, OXIDANT, REDUCTANT, ACID = "base", "oxidant", "reductant", "acid"
-FUNCTIONS = (BASE, OXIDANT, REDUCTANT, ACID)
+METAL_CATALYST = "metal_catalyst"
+FUNCTIONS = (BASE, OXIDANT, REDUCTANT, ACID, METAL_CATALYST)
+# Условия процесса, а не сырьё: не блокируют реакцию, указываются в выдаче.
+CONDITIONS = {METAL_CATALYST}
 REQUIRED_SHARE = 0.5  # функция нужна шаблону, если есть в >50% прецедентов
 MIN_FUNCTION_SHARE = 0.25  # функция вещества должна встречаться в ≥25% прецедентов
 
 _BASE_SMILES = {"[OH-]", "O=C([O-])[O-]", "O=C([O-])O", "[NH2-]", "O=P([O-])([O-])[O-]"}
 _OXIDANT_SMILES = {"O=O", "S1SSSSSSS1", "[O-]Cl", "O=Cl[O-]", "OO"}
-_OXIDANT_METALS = {"Mn", "Cr", "Os", "Ru", "Se"}
+_OXIDANT_METALS = {"Mn", "Cr", "Os", "Se"}
+_CATALYST_METALS = {"Pd", "Pt", "Ni", "Rh", "Ru", "Ir", "Au", "Ag", "Co", "Cu", "V"}
+_LEWIS_ACID_ATOMS = {"Al", "B", "Ti", "Zn", "Sn", "Fe"}
+_LEWIS_ACID_IONS = {"[Al+3]", "[Ti+4]", "[Zn+2]", "[Fe+3]", "[Sn+4]"}
+_HALIDE_IONS = {"[F-]", "[Cl-]", "[Br-]", "[I-]"}
 _ACID_SMILES = {
     "Cl",  # HCl
     "Br",  # HBr
@@ -749,8 +774,16 @@ def _fragment_functions(smiles: str, has_hydride_carrier: bool) -> set[str]:
     out = set()
     for a in mol.GetAtoms():
         sym, q = a.GetSymbol(), a.GetFormalCharge()
-        if sym in ("B", "Al") and (a.GetTotalNumHs() > 0 or q < 0):
+        if sym in _CATALYST_METALS:
+            out.add(METAL_CATALYST)  # Pd, Pt, Ni, V2O5...
+        elif sym in ("B", "Al") and (a.GetTotalNumHs() > 0 or q < 0):
             out.add(REDUCTANT)  # борогидриды, алюмогидриды
+        elif (
+            sym in _LEWIS_ACID_ATOMS
+            and q == 0
+            and any(n.GetSymbol() in ("F", "Cl", "Br", "I") for n in a.GetNeighbors())
+        ):
+            out.add(ACID)  # кислоты Льюиса: AlCl3, BF3, TiCl4, ZnCl2
         elif sym in _OXIDANT_METALS or (sym == "I" and a.GetDegree() > 1):
             out.add(OXIDANT)  # перманганат, хромовые, OsO4, Десс–Мартин, IBX
         elif sym == "O" and any(n.GetSymbol() == "O" for n in a.GetNeighbors()):
@@ -782,6 +815,9 @@ def reagent_functions(fragments) -> set[str]:
     out = set()
     for f in frags:
         out |= _fragment_functions(f, carrier)
+    # кислота Льюиса в ионной записи: [Al+3] + 3 [Cl-] (без гидрида — не LiAlH4)
+    if set(frags) & _LEWIS_ACID_IONS and set(frags) & _HALIDE_IONS and "[H-]" not in frags:
+        out.add(ACID)
     return out
 
 
@@ -945,6 +981,14 @@ class Template:
             f for f, share in self.function_share.items() if share > REQUIRED_SHARE
         } | self.intrinsic_functions
         self.ex_functions = ex_functions
+        # катализаторы прецедентов — для выдачи (условие процесса, не сырьё)
+        cat = collections.Counter(
+            f
+            for ex in self.examples
+            for f in set(ex.get("spectators", []))
+            if METAL_CATALYST in reagent_functions([f])
+        )
+        self.catalysts = [f for f, _ in cat.most_common(2)]
         # Классы атомов центра в прецедентах и самая сильная конкурирующая
         # группа, при которой прецедент всё же шёл по этому центру (R17).
         self.center_classes: dict[int, set] = collections.defaultdict(set)
@@ -963,7 +1007,7 @@ class Template:
         # реагента превращение не идёт, и применять его «в пустоту» нельзя.
         # Шаблон, которому нужна функция реагента (окислитель, основание...),
         # без такого реагента тоже не применяется.
-        self.needs_reagent = bool(self.required_functions) or (
+        self.needs_reagent = bool(self.required_functions - CONDITIONS) or (
             len(self.slots) == 1 and bool(self.spectator_sets) and all(self.spectator_sets)
         )
         return self
@@ -987,7 +1031,16 @@ class Template:
         fs = frag_set(smiles)
         if not fs or not any(fs <= sp for sp in self.spectator_sets):
             return False
-        if not self.required_functions <= functions:
+        if not (self.required_functions - CONDITIONS) <= functions:
+            return False
+        # окислитель/восстановитель — только в окислительно-восстановительном
+        # превращении, либо если прецеденты устойчиво (>=50%) его используют
+        redox = functions & {OXIDANT, REDUCTANT}
+        if (
+            redox
+            and not redox & self.intrinsic_functions
+            and max(self.function_share[f] for f in redox) < REQUIRED_SHARE
+        ):
             return False
         return max(self.function_share[f] for f in functions) >= MIN_FUNCTION_SHARE
 
@@ -1079,15 +1132,22 @@ def cmd_apply(args):
     t_start = time.time()
     templates = load_templates(args.templates, args.min_count, args.min_selfcheck)
     inputs = load_inputs(args.inputs)
-    user_frags = {frag_set(i["canon"]) for i in inputs if i["mol"] is not None}
+    # Всегда доступные ресурсы (вода, воздух; решение 0011): партнёры и
+    # реагенты наравне с набором, но сами стадии не запускают.
+    utilities = (
+        [u for u in load_inputs(args.utilities) if u["mol"] is not None] if args.utilities else []
+    )
+    utility_canon = {u["canon"] for u in utilities}
+    user_frags = {frag_set(i["canon"]) for i in inputs + utilities if i["mol"] is not None}
 
     # Пул известных веществ: исходный набор пользователя + продукты прошлых
     # стадий. В режиме --internal-only партнёры берутся только отсюда.
-    pool = {i["canon"]: i["mol"] for i in inputs if i["mol"] is not None}
+    pool = {i["canon"]: i["mol"] for i in inputs + utilities if i["mol"] is not None}
     pool_level = {c: 0 for c in pool}
     pool_frags = {frag_set(c) for c in pool}
-    # каким шаблоном получено вещество пула (R18: шаблон не наращивает свой продукт)
-    made_template: dict[str, str] = {}
+    # Каким шаблоном получено вещество пула: (шаблон, повтор, серия). Шаблон
+    # наращивает свой продукт не больше --max-repeat раз (олигомеры, решение 0011).
+    made_template: dict[str, tuple[str, int, str]] = {}
 
     # Словарь внешних партнёров: реагенты из прецедентов корпуса с частотами,
     # опционально — пересечение с покупаемыми (база экономического агента).
@@ -1124,7 +1184,8 @@ def cmd_apply(args):
 
         for s, m in pool.items():
             if m.HasSubstructMatch(slot):
-                add(s, "user" if pool_level[s] == 0 else "intermediate")
+                src = "utility" if s in utility_canon else "user"
+                add(s, src if pool_level[s] == 0 else "intermediate")
         if not args.internal_only:
             for ex in t.examples:
                 for s in ex["reactants"]:
@@ -1150,7 +1211,7 @@ def cmd_apply(args):
             (
                 ex
                 for ex, fs in zip(t.examples, t.ex_functions, strict=True)
-                if t.required_functions <= fs
+                if (t.required_functions - CONDITIONS) <= fs
             ),
             None,
         )
@@ -1175,11 +1236,15 @@ def cmd_apply(args):
             """combo: [(smiles, source)], где source='input' — само соединение;
             reagent — сопутствующий реагент (в продукт не входит)."""
             smiles_combo = [s for s, _ in combo]
-            if any(made_template.get(s) == t.id for s in smiles_combo):
-                counts["skipped_own_product"] += 1  # олигомеры: C12E1 -> C12E2 -> ...
-                return
+            own = [made_template[s] for s in smiles_combo if made_template.get(s, ("",))[0] == t.id]
+            repeat, series = 1, None
+            if own:
+                repeat, series = max(k for _, k, _ in own) + 1, own[0][2]
+                if repeat > args.max_repeat:
+                    counts["skipped_repeat"] += 1  # C12E3 -> C12E4 -> ...
+                    return
             mols = [Chem.MolFromSmiles(s) for s in smiles_combo]
-            for prod, provenance in run_products_traced(t.rxn, mols).items():
+            for prod, provenance in run_products_traced(t.rxn, mols, keep_new_stereo=False).items():
                 if prod in smiles_combo:
                     continue
                 if not t.selective(provenance, mols):
@@ -1216,6 +1281,9 @@ def cmd_apply(args):
                     # реакция без средней части: варианты с разными
                     # сопутствующими реагентами — одна реакция (R13)
                     "reaction_core": ".".join(sorted(smiles_combo)) + ">>" + prod,
+                    # серия олигомеров: C12E1..C12E3 — одна реакция для 2.1
+                    "series": series or ".".join(sorted(smiles_combo)) + ">>" + prod,
+                    "repeat": repeat,
                     "reagent": reagent,
                     "type_key": t.type_key,
                     "template_id": t.id,
@@ -1228,6 +1296,7 @@ def cmd_apply(args):
                     "precedent_id": ex["id"],
                     "precedent_rxn": ".".join(ex["reactants"]) + ">>" + ex["product"],
                     "precedent_source": ex.get("source") or NO_SOURCE,
+                    "catalyst": ".".join(t.catalysts),
                 }
                 events.append((core, rec, None))
 
@@ -1314,7 +1383,8 @@ def cmd_apply(args):
             m = Chem.MolFromSmiles(prod)
             if m is not None and m.GetNumHeavyAtoms() <= args.max_heavy_atoms:
                 pool[prod], pool_level[prod] = m, level
-                made_template[prod] = new_products[prod]["template_id"]
+                rec = new_products[prod]
+                made_template[prod] = (rec["template_id"], rec["repeat"], rec["series"])
                 pool_frags.add(frag_set(prod))
         frontier = [
             {"name": f"[стадия {level}] {p}", "canon": p, "mol": pool[p]}
@@ -1342,6 +1412,8 @@ def cmd_apply(args):
         "role",
         "reaction_key",
         "reaction_core",
+        "series",
+        "repeat",
         "reagent",
         "type_key",
         "template_id",
@@ -1354,6 +1426,7 @@ def cmd_apply(args):
         "precedent_id",
         "precedent_rxn",
         "precedent_source",
+        "catalyst",
     ]
     write_csv(args.out, results, fields)
     elapsed = time.time() - t_start
@@ -1386,6 +1459,8 @@ def cmd_apply(args):
         f"**{len({r['type_key'] for r in results})}**",
         f"- Вариантов с разными сопутствующими реагентами (считаются как одна реакция): "
         f"{len({r['reaction_key'] for r in results})}",
+        f"- **Для критерия 2.1** (серия олигомеров одного шаблона — одна реакция, "
+        f"решение 0011): **{len({r['series'] for r in results if r['partner_source'] in ('internal', 'internal+intermediate')})}**",
         f"- Все участники — исходный набор: **{len(uniq_int)}**",
         f"- Все участники — исходный набор и полученные из него промежуточные: **{len(uniq_net)}**\n",
     ]
@@ -1553,6 +1628,10 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--templates", required=True)
     a.add_argument("--inputs", required=True, help="CSV с колонками name,smiles")
     a.add_argument("--purchasable", help="CSV с колонкой smiles: ограничить партнёров покупаемыми")
+    a.add_argument(
+        "--utilities",
+        help="CSV name,smiles: всегда доступные ресурсы (вода, воздух), data/inputs/utilities.csv",
+    )
     a.add_argument("--out", required=True)
     a.add_argument("--report", required=True)
     a.add_argument("--min-count", type=int, default=2)
@@ -1573,6 +1652,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="не пускать на следующую стадию продукты крупнее этого",
     )
     a.add_argument("--max-routes", type=int, default=15, help="маршрутов в отчёте")
+    a.add_argument(
+        "--max-repeat",
+        type=int,
+        default=3,
+        help="сколько раз подряд шаблон наращивает свой продукт (олигомеры)",
+    )
     a.add_argument("--jobs", type=int, default=0, help="процессов; 0 — все ядра")
     a.set_defaults(func=cmd_apply)
 
