@@ -1,4 +1,4 @@
-.PHONY: setup test test-all lint format demo fixtures corpus eval
+.PHONY: setup test test-all lint format demo fixtures corpus eval balance
 
 PY ?= python
 ENGINE = $(PY) -m chem_agent.template_engine
@@ -8,6 +8,7 @@ LABEL ?= full-v1
 CORPUS_OUT ?= outputs/$(shell date +%F)-$(LABEL)
 PREP_ARGS ?=
 TEMPLATES ?=
+IN ?=
 
 setup:            ## установить пакет со всеми зависимостями
 	$(PY) -m pip install -e ".[mapping,dev]"
@@ -49,3 +50,6 @@ fixtures:         ## пересобрать размеченные фиксту�
 
 eval:             ## качество на реакциях с вердиктом химика: make eval TEMPLATES=outputs/<прогон>/templates.jsonl
 	$(PY) -m chem_agent.review_eval --templates $(TEMPLATES) --out-dir $(dir $(TEMPLATES))eval
+
+balance:          ## полные уравнения: make balance IN=outputs/<прогон>/network.csv -> *_balanced.csv
+	$(PY) -m chem_agent.balancer --in $(IN) --out $(basename $(IN))_balanced.csv
