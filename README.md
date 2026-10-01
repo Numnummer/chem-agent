@@ -23,6 +23,22 @@ make demo         # полный прогон на демо -> outputs/demo/
 claude
 ```
 
+## MVP: набор веществ → отранжированные реакции
+
+```bash
+make templates                       # один раз: корпус -> шаблоны (data/raw/, нужен rxnmapper)
+make analyze TEMPLATES=outputs/<дата>-full-v1/templates.jsonl INPUTS=мой_набор.csv
+```
+
+Вход — CSV `name,smiles` (элементарная сера — `S1SSSSSSS1`, NaOH — `[Na+].[OH-]`,
+электроэнергия — `resource`). Выход в `outputs/<дата>-mvp/`: `report.html`
+(отчёт для показа), `results.json` / `results.csv`, `summary.md` (критерии ТЗ
+2.1–2.3), `vectordb.*`. Для уровня доверия I и условий прецедентов добавьте
+`ANALYZE_ARGS="--depth 4 --corpus <corpus.csv> --meta <meta.csv>"`.
+
+Цены — `data/prices/` (ориентировочные, заменить ценами заказчика), параметры
+и веса ранжирования — `data/config/mvp.json`, допущения — `docs/decisions/0016`.
+
 ## Что настроено для Claude Code
 
 | Файл | Зачем |

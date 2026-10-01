@@ -1,0 +1,7 @@
+class,name,smarts,only_elements,price_usd_per_t,source
+alkyl_ether_sulfate_na,Алкил(эфир)сульфат натрия C10+ (SDS/SLES),[CH2][CH2][CH2][CH2][CH2][CH2][CH2][CH2][CH2]~*.[$(OS(=O)(=O)[O-])],,1600,оценка
+alkyl_ether_sulfuric_acid,Алкил(эфир)серная кислота C10+,[CH2][CH2][CH2][CH2][CH2][CH2][CH2][CH2][CH2]~*.[$(OS(=O)(=O)[OH])],,1400,оценка
+alkyl_ether_carboxylate_na,Алкилэфиркарбоксилат натрия C10+ (AEC),[CH2][CH2][CH2][CH2][CH2][CH2][CH2][CH2][CH2]~*.[$(C(=O)[O-])],,2500,оценка
+fatty_alcohol_alkoxylate,Алкоксилат жирного спирта C10+,[CH2][CH2][CH2][CH2][CH2][CH2][CH2][CH2][CH2]~*.[$([OH][CX4])].[$([OX2]([CX4])[CX4])],"C,H,O",1800,оценка
+allyl_glycol_ether,Аллиловый эфир гликоля,[$(C=CCO[CX4])].[$([OH][CX4])],"C,H,O",2000,оценка
+polyglycol,Гликоли и полигликоли (ДЭГ/ДПГ/ТПГ и смешанные),[$([OX2]([CX4])[CX4])].[$([OH][CX4])],"C,H,O",1500,оценка

@@ -1,4 +1,4 @@
-.PHONY: setup test test-all lint format demo fixtures corpus eval balance
+.PHONY: setup test test-all lint format demo fixtures corpus eval balance templates analyze eval-economics
 
 PY ?= python
 ENGINE = $(PY) -m chem_agent.template_engine
@@ -9,6 +9,9 @@ CORPUS_OUT ?= outputs/$(shell date +%F)-$(LABEL)
 PREP_ARGS ?=
 TEMPLATES ?=
 IN ?=
+INPUTS ?= data/inputs/priority_set.csv
+MVP_OUT ?= outputs/$(shell date +%F)-mvp
+ANALYZE_ARGS ?= --depth 4
 
 setup:            ## установить пакет со всеми зависимостями
 	$(PY) -m pip install -e ".[mapping,dev]"
@@ -53,3 +56,16 @@ eval:             ## качество на реакциях с вердикто�
 
 balance:          ## полные уравнения: make balance IN=outputs/<прогон>/network.csv -> *_balanced.csv
 	$(PY) -m chem_agent.balancer --in $(IN) --out $(basename $(IN))_balanced.csv
+
+templates:        ## шаблоны из корпуса -> $(CORPUS_OUT)/templates.jsonl (нужен rxnmapper; ~20 мин CPU)
+	$(MAKE) corpus
+	$(ENGINE) map --corpus $(CORPUS_OUT)/corpus.csv --out $(CORPUS_OUT)/mapped.csv
+	$(ENGINE) map --corpus data/manual/inorganic.csv --out $(CORPUS_OUT)/manual_mapped.csv
+	$(ENGINE) extract --mapped $(CORPUS_OUT)/mapped.csv $(CORPUS_OUT)/manual_mapped.csv \
+		--trusted $(CORPUS_OUT)/manual_mapped.csv --out $(CORPUS_OUT)/templates.jsonl
+
+analyze:          ## MVP: набор -> отранжированные реакции: make analyze TEMPLATES=... [INPUTS=...]
+	$(PY) -m chem_agent.pipeline --inputs $(INPUTS) --templates $(TEMPLATES) --out $(MVP_OUT) $(ANALYZE_ARGS)
+
+eval-economics:   ## точность экономики на эталоне: make eval-economics TEMPLATES=...
+	$(PY) -m chem_agent.economics_eval --templates $(TEMPLATES) --out outputs/$(shell date +%F)-eval-economics
