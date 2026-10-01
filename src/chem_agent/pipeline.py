@@ -178,17 +178,23 @@ def run(args) -> dict:
         memo[key] = best
         return best[0]
 
+    def made_in_network(smiles: str) -> bool:
+        """Вещество посчитано по себестоимости маршрута («сделать» дешевле «купить»)."""
+        key = canon(smiles) or smiles
+        route = memo.get(key, (None, None))[0]
+        market = book.exact.get(key)
+        return route is not None and (market is None or route.usd_per_t < market.usd_per_t)
+
     def route_steps(smiles: str, seen=None) -> list[dict]:
         seen = set() if seen is None else seen
         key = canon(smiles) or smiles
         p = memo.get(key, (None, None))[1]
-        if p is None or key in seen:
+        if p is None or key in seen or not made_in_network(key):
             return []
         seen.add(key)
         steps = []
         for s, _ in p["_balanced"].reactants:
-            if book.exact.get(canon(s) or s) is None:
-                steps += route_steps(s, seen)
+            steps += route_steps(s, seen)
         return steps + [p]
 
     for r in results:
@@ -200,8 +206,7 @@ def run(args) -> dict:
         r["_eco"] = eco
         r["_route"] = []
         for s, _ in b.reactants:
-            if eco.raw and book.exact.get(canon(s) or s) is None:
-                r["_route"] += [x for x in route_steps(s) if x not in r["_route"]]
+            r["_route"] += [x for x in route_steps(s) if x not in r["_route"]]
     for r in results:
         eco = r.get("_eco")
         r["raw_cost_usd_t"] = None if eco is None else eco.raw_cost

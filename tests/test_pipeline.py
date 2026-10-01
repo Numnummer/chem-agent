@@ -60,3 +60,13 @@ def test_report_embeds_data(analysis):
     page = (out / "report.html").read_text(encoding="utf-8")
     assert "<title>" in page and '"reactions"' in page
     assert res["reactions"][0]["reaction_names"].split(" ")[0] in page
+
+
+def test_route_shows_what_economics_used(analysis):
+    """Маршрут в отчёте — те стадии, по которым посчитана себестоимость сырья
+    (в т. ч. веществ из прайса, если «сделать» дешевле «купить»)."""
+    _, res = analysis
+    for r in res["reactions"]:
+        e = r["economics_usd_per_t"]
+        if e and any(m["basis"] == "route" for m in e["raw_materials"]):
+            assert r["route"], r["reaction_names"]
